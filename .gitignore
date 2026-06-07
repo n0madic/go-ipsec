@@ -1,0 +1,5 @@
+/bin/
+*.pcap
+*.pem
+*.test
+coverage.out

@@ -1,0 +1,21 @@
+# Local strongSwan IKEv2-EAP-MSCHAPv2 server for go-ipsec interop testing.
+#
+#   docker compose up --build      # generates certs + serves UDP 500/4500
+#
+# The entrypoint generates a fresh CA + server cert on every start and exports
+# the CA to ./pki/caCert.pem for the host-side client to trust — no separate
+# cert step. privileged is required for the server's kernel XFRM/ESP path. The
+# client (go-ipsec) is userspace and needs no privileges.
+services:
+  vpn:
+    build: .
+    privileged: true
+    ports:
+      - "500:500/udp"
+      - "4500:4500/udp"
+    volumes:
+      # Writable: the entrypoint exports caCert.pem here for the host client.
+      - ./pki:/pki
+      - ./ipsec.conf:/etc/ipsec.conf:ro
+      - ./ipsec.secrets:/etc/ipsec.secrets:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
