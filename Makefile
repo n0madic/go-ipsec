@@ -14,13 +14,16 @@ IPSEC_SERVER    ?= 127.0.0.1:500
 IPSEC_EAP_USER  ?= testuser
 IPSEC_EAP_PASS  ?= testpass
 IPSEC_REMOTE_ID ?= vpn.example.com
+# Pre-shared key for the PSK live test; matches the `rw-psk` conn secret in
+# test/strongswan/ipsec.secrets.
+IPSEC_PSK       ?= test-preshared-key
 # Exported by the strongSwan container's entrypoint on startup (see e2e-up).
 IPSEC_CA        := $(abspath test/strongswan/pki/caCert.pem)
 PKI_DIR         := test/strongswan/pki
 
 E2E_ENV = IPSEC_SERVER=$(IPSEC_SERVER) IPSEC_EAP_USER=$(IPSEC_EAP_USER) \
           IPSEC_EAP_PASS=$(IPSEC_EAP_PASS) IPSEC_REMOTE_ID=$(IPSEC_REMOTE_ID) \
-          IPSEC_CA=$(IPSEC_CA)
+          IPSEC_CA=$(IPSEC_CA) IPSEC_PSK=$(IPSEC_PSK)
 
 .DEFAULT_GOAL := help
 

@@ -45,6 +45,33 @@ func TestConfigValidateRequiresCredentials(t *testing.T) {
 	}
 }
 
+// TestConfigValidatePSK covers the PSK/EAP credential dispatch: a PSK-only config
+// validates (no EAP, no RootCAs needed), supplying both PSK and EAP is rejected as
+// ambiguous, and supplying neither is rejected.
+func TestConfigValidatePSK(t *testing.T) {
+	pskOnly := Config{Server: "vpn.example.com:500", PSK: "sharedsecret"}
+	if err := pskOnly.validate(); err != nil {
+		t.Fatalf("PSK-only config rejected: %v", err)
+	}
+	if pskOnly.MTU != DefaultMTU {
+		t.Fatal("validate did not fill defaults for a PSK config")
+	}
+
+	both := Config{
+		Server: "vpn.example.com:500",
+		PSK:    "sharedsecret",
+		EAP:    EAPMSCHAPv2{Username: "user", Password: "secret"},
+	}
+	if err := both.validate(); err == nil {
+		t.Fatal("config with both PSK and EAP accepted")
+	}
+
+	neither := Config{Server: "vpn.example.com:500"}
+	if err := neither.validate(); err == nil {
+		t.Fatal("config with neither PSK nor EAP accepted")
+	}
+}
+
 // TestConfigValidateFloorsRekeyMaxPackets is finding #6: a tiny non-zero
 // RekeyMaxPackets is raised to MinRekeyMaxPackets so it cannot churn the data
 // plane; zero keeps the "use the built-in default" contract; a value at or above

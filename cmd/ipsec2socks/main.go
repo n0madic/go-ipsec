@@ -1,6 +1,7 @@
-// Command ipsec2socks dials an IKEv2-EAP-MSCHAPv2 VPN server and exposes the
-// tunnel as a local SOCKS5 proxy. Any process can then route traffic through
-// the VPN by pointing its SOCKS5 client at the proxy, e.g.:
+// Command ipsec2socks dials an IKEv2 VPN server (authenticating with either
+// EAP-MSCHAPv2 or a pre-shared key) and exposes the tunnel as a local SOCKS5
+// proxy. Any process can then route traffic through the VPN by pointing its
+// SOCKS5 client at the proxy, e.g.:
 //
 //	curl --socks5-hostname 127.0.0.1:1080 https://example.com
 //
@@ -31,6 +32,7 @@ type cliOpts struct {
 	caFile    string
 	eapUser   string
 	eapPass   string
+	psk       string
 	localID   string
 	remoteID  string
 	listen    string
@@ -51,6 +53,7 @@ func parseFlags() *cliOpts {
 	flag.StringVar(&o.caFile, "ca", "", "PEM file with CA certificate(s) trusted for the server chain")
 	flag.StringVar(&o.eapUser, "eap-user", os.Getenv("IPSEC_EAP_USER"), "EAP-MSCHAPv2 username (default: $IPSEC_EAP_USER)")
 	flag.StringVar(&o.eapPass, "eap-pass", os.Getenv("IPSEC_EAP_PASS"), "EAP-MSCHAPv2 password (default: $IPSEC_EAP_PASS)")
+	flag.StringVar(&o.psk, "psk", os.Getenv("IPSEC_PSK"), "pre-shared key for PSK auth (default: $IPSEC_PSK); mutually exclusive with -eap-user/-eap-pass")
 	flag.StringVar(&o.localID, "local-id", "", "local IKE identity (email, FQDN, or IP)")
 	flag.StringVar(&o.remoteID, "remote-id", "", "expected server identity, matched against the certificate SAN (email, FQDN, or IP)")
 	flag.StringVar(&o.listen, "listen", "127.0.0.1:1080", "SOCKS5 listen address")
@@ -84,8 +87,16 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	if opts.server == "" {
 		return errors.New("-server is required")
 	}
-	if opts.eapUser == "" || opts.eapPass == "" {
-		return errors.New("-eap-user and -eap-pass are required (or set $IPSEC_EAP_USER/$IPSEC_EAP_PASS)")
+	// Authentication: exactly one of PSK or EAP-MSCHAPv2.
+	hasPSK := opts.psk != ""
+	hasEAP := opts.eapUser != "" || opts.eapPass != ""
+	switch {
+	case hasPSK && hasEAP:
+		return errors.New("set either -psk or -eap-user/-eap-pass, not both")
+	case !hasPSK && !hasEAP:
+		return errors.New("authentication required: -psk (or $IPSEC_PSK), or -eap-user/-eap-pass (or $IPSEC_EAP_USER/$IPSEC_EAP_PASS)")
+	case hasEAP && (opts.eapUser == "" || opts.eapPass == ""):
+		return errors.New("-eap-user and -eap-pass are both required for EAP-MSCHAPv2 auth")
 	}
 	if err := checkLoopbackBind(opts.listen, opts.insecure); err != nil {
 		return err
@@ -93,11 +104,15 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 
 	cfg := ipsec.Config{
 		Server:           opts.server,
-		EAP:              ipsec.EAPMSCHAPv2{Username: opts.eapUser, Password: opts.eapPass},
 		Logger:           logger,
 		RekeyLifetime:    opts.rekey,
 		IKERekeyLifetime: opts.ikeRekey,
 		DPDTimeout:       opts.dpd,
+	}
+	if hasPSK {
+		cfg.PSK = opts.psk
+	} else {
+		cfg.EAP = ipsec.EAPMSCHAPv2{Username: opts.eapUser, Password: opts.eapPass}
 	}
 	if opts.localID != "" {
 		cfg.LocalID = parseIdentity(opts.localID)
@@ -136,7 +151,11 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	dialCtx, dialCancel := context.WithTimeout(rootCtx, opts.timeout+10*time.Second)
 	defer dialCancel()
 
-	logger.Info("dialing IKEv2", "server", opts.server, "user", opts.eapUser)
+	authMode := "eap-mschapv2"
+	if hasPSK {
+		authMode = "psk"
+	}
+	logger.Info("dialing IKEv2", "server", opts.server, "auth", authMode)
 	client, err := ipsec.Dial(dialCtx, cfg)
 	if err != nil {
 		return fmt.Errorf("ipsec dial: %w", err)

@@ -1,8 +1,10 @@
 # Local strongSwan interop server
 
-A throwaway IKEv2-EAP-MSCHAPv2 server configured to negotiate exactly the suite
-go-ipsec implements (AES-CBC-256 / HMAC-SHA2-256 / DH group 14). Use it to run
-the build-tagged live tests and `ipsec2socks` against a real responder.
+A throwaway IKEv2 server configured to negotiate exactly the suite go-ipsec
+implements (AES-CBC-256 / HMAC-SHA2-256 / DH group 14). It serves two roadwarrior
+conns on the same gateway — `rw` (EAP-MSCHAPv2 + server cert) and `rw-psk`
+(pre-shared key, no cert) — so both go-ipsec auth modes can be exercised against a
+real responder, along with `ipsec2socks`.
 
 ## 1. Start the server
 
@@ -13,8 +15,9 @@ docker compose up --build      # serves UDP 500 + 4500
 
 The entrypoint generates a fresh CA + server certificate on every start and
 exports the CA to `pki/caCert.pem` for the host-side client — no separate cert
-step. Default credentials (edit `ipsec.secrets`): user `testuser`, pass
-`testpass`. Server identity: `vpn.example.com` (cert SAN). CA: `pki/caCert.pem`.
+step. Default credentials (edit `ipsec.secrets`): EAP user `testuser`, pass
+`testpass`; PSK `test-preshared-key` (client IDi `@client.test`). Server identity:
+`vpn.example.com` (cert SAN). CA: `pki/caCert.pem`.
 
 > **NAT-T:** go-ipsec is userspace and cannot send raw ESP, so it always uses
 > UDP-encapsulation on port 4500. Because its NAT-detection source hash uses an
@@ -45,6 +48,18 @@ you point the suite at a different server.
 a TCP connection over inner IPv6; `TestLiveHTTPGet` routes an HTTP GET through the
 tunnel and logs the exit IP; `TestLiveDiag` dumps the gVisor IP/TCP stack counters
 after a dial, for debugging packet-path issues.
+
+To exercise the **PSK** auth path instead, drive the `rw-psk` conn — no `-ca` or
+EAP credentials, just the pre-shared key:
+
+```sh
+IPSEC_SERVER=127.0.0.1:500 IPSEC_PSK=test-preshared-key \
+go test -tags e2e_server -v ./test/integration -run LivePSK
+```
+
+`TestLivePSKHandshake` asserts the Child SA + CP address and routes an HTTP GET
+through the PSK tunnel. `make e2e` runs the EAP and PSK tests together (it passes
+both credential sets).
 
 ## 3. Run the SOCKS5 sidecar
 

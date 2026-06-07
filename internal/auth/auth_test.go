@@ -43,13 +43,13 @@ func TestSignedOctets(t *testing.T) {
 	}
 }
 
-func TestMSKAuth(t *testing.T) {
-	msk := bytes.Repeat([]byte{0x5A}, 64)
+func TestSharedSecretAuth(t *testing.T) {
+	secret := bytes.Repeat([]byte{0x5A}, 64)
 	so := []byte("signed-octets")
-	got := MSKAuth(testPRF, msk, so)
-	want := testPRF(testPRF(msk, keyPad), so)
+	got := SharedSecretAuth(testPRF, secret, so)
+	want := testPRF(testPRF(secret, keyPad), so)
 	if !bytes.Equal(got, want) {
-		t.Fatal("MSKAuth != prf(prf(msk,keypad),so)")
+		t.Fatal("SharedSecretAuth != prf(prf(secret,keypad),so)")
 	}
 }
 

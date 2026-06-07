@@ -34,8 +34,10 @@ const (
 	DefaultReconnectAttemptTimeout time.Duration = 20 * time.Second
 )
 
-// Config describes a single IKEv2-EAP-MSCHAPv2 tunnel. Only stdlib-shaped
-// fields are exposed; everything provider-specific lives in the caller.
+// Config describes a single IKEv2 tunnel. The client authenticates with either
+// EAP-MSCHAPv2 (set EAP) or a pre-shared key (set PSK) — exactly one of the two.
+// Only stdlib-shaped fields are exposed; everything provider-specific lives in the
+// caller.
 //
 // The cipher suite is fixed and not configurable: AES-CBC-256 encryption,
 // PRF-HMAC-SHA2-256, AUTH-HMAC-SHA2-256-128 integrity, and a DH group of
@@ -50,11 +52,18 @@ type Config struct {
 	LocalID  Identity
 	RemoteID Identity
 
-	// EAP carries the EAP-MSCHAPv2 credentials.
+	// EAP carries the EAP-MSCHAPv2 credentials. Set either EAP or PSK, not both.
 	EAP EAPMSCHAPv2
 
-	// RootCAs is the trust anchor pool for the server certificate chain. When
-	// nil the host's system roots are used.
+	// PSK is the pre-shared key for PSK authentication (RFC 7296 §2.15). Set
+	// either PSK or EAP, not both. With PSK the IKE identity is taken directly from
+	// LocalID/RemoteID (there is no EAP username), and no server certificate is
+	// involved, so RootCAs is unused; RemoteID, when set, is the IDr the server
+	// must present.
+	PSK string
+
+	// RootCAs is the trust anchor pool for the server certificate chain (EAP
+	// only). When nil the host's system roots are used.
 	RootCAs *x509.CertPool
 
 	// Transport supplies the underlying packet socket. When nil a direct UDP
@@ -141,11 +150,22 @@ func (c *Config) validate() error {
 	if c.Server == "" {
 		return errors.New("ipsec: Config.Server is required")
 	}
-	if c.EAP.Username == "" {
-		return errors.New("ipsec: Config.EAP.Username is required")
-	}
-	if c.EAP.Password == "" {
-		return errors.New("ipsec: Config.EAP.Password is required")
+	// Authentication: exactly one of PSK or EAP. EAP requires both username and
+	// password; supplying both PSK and EAP (or neither) is a configuration error.
+	hasPSK := c.PSK != ""
+	hasEAP := c.EAP.Username != "" || c.EAP.Password != ""
+	switch {
+	case hasPSK && hasEAP:
+		return errors.New("ipsec: set either Config.PSK or Config.EAP, not both")
+	case !hasPSK && !hasEAP:
+		return errors.New("ipsec: authentication credentials required: set Config.PSK or Config.EAP")
+	case hasEAP:
+		if c.EAP.Username == "" {
+			return errors.New("ipsec: Config.EAP.Username is required")
+		}
+		if c.EAP.Password == "" {
+			return errors.New("ipsec: Config.EAP.Password is required")
+		}
 	}
 	if c.MTU == 0 {
 		c.MTU = DefaultMTU

@@ -294,7 +294,7 @@ func runResponder(t *testing.T, conn transport.Conn, username, password string, 
 		return fail(err)
 	}
 	initSigned := iauth.SignedOctets(rs.ikeSA.PRF, raw1, nr, ikemsg.MarshalIDBody(idi.IDType, idi.Data), rs.ikeSA.SKpi)
-	wantInitAuth := iauth.MSKAuth(rs.ikeSA.PRF, msk, initSigned)
+	wantInitAuth := iauth.SharedSecretAuth(rs.ikeSA.PRF, msk, initSigned)
 	if !bytes.Equal(initAuth.Data, wantInitAuth) {
 		return fail(errFail("initiator MSK AUTH mismatch"))
 	}
@@ -305,7 +305,7 @@ func runResponder(t *testing.T, conn transport.Conn, username, password string, 
 	res.childResponderSPI = binary.BigEndian.Uint32(childSPIBuf[:])
 	res.childKeys = rs.ikeSA.DeriveChildKeys(ni, nr, espEncrKeyLen, espIntegKeyLen)
 
-	respAuth := iauth.MSKAuth(rs.ikeSA.PRF, msk, respSigned)
+	respAuth := iauth.SharedSecretAuth(rs.ikeSA.PRF, msk, respSigned)
 	m10 := ikemsg.Payloads{
 		&ikemsg.AuthPayload{Method: iauth.MethodSharedKeyMIC, Data: respAuth},
 		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, childSPIBuf[:])}},
@@ -329,6 +329,252 @@ func runResponder(t *testing.T, conn transport.Conn, username, password string, 
 		return fail(err)
 	}
 	if err := conn.Send(ctx, out10); err != nil {
+		return fail(err)
+	}
+	return res
+}
+
+// TestOfflineHandshakePSK drives the initiator state machine through the PSK
+// IKE_AUTH path (IKE_SA_INIT + a single-round PSK IKE_AUTH + Child SA) against a
+// cooperating in-memory PSK responder. It proves both ends reach "established"
+// and derive identical Child SA keys with no EAP conversation and no certificate.
+func TestOfflineHandshakePSK(t *testing.T) {
+	psk := []byte("a-strong-preshared-key")
+	initConn, respConn := transport.MemoryPair()
+
+	initSess := New(Config{
+		Server:          "mem:500",
+		LocalID:         WireID{Type: uint8(ikemsg.IDTypeFQDN), Data: []byte("client.test")},
+		RemoteID:        WireID{Type: uint8(ikemsg.IDTypeFQDN), Data: []byte("vpn.test")},
+		PSK:             psk,
+		Logger:          slog.New(slog.DiscardHandler),
+		RetransmitBase:  2 * time.Second,
+		RetransmitMax:   4 * time.Second,
+		RetransmitTries: 3,
+	})
+	initSess.conn = initConn
+
+	respDone := make(chan *responderResult, 1)
+	go func() { respDone <- runResponderPSK(respConn, psk) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := initSess.IKESAInit(ctx); err != nil {
+		t.Fatalf("IKESAInit: %v", err)
+	}
+	if err := initSess.IKEAuth(ctx); err != nil {
+		t.Fatalf("IKEAuth (PSK): %v", err)
+	}
+	if !initSess.Established() {
+		t.Fatal("session not established")
+	}
+
+	res := <-respDone
+	if res.err != nil {
+		t.Fatalf("responder: %v", res.err)
+	}
+	if initSess.Assigned().IP != netip.MustParseAddr("10.10.0.77") {
+		t.Fatalf("assigned IP = %v, want 10.10.0.77", initSess.Assigned().IP)
+	}
+	// The responder's IDr (carried in the single PSK response) must be recorded.
+	if got := string(initSess.remoteIDr.Data); got != "vpn.test" {
+		t.Fatalf("remote IDr = %q, want vpn.test", got)
+	}
+	child := initSess.Child()
+	if child == nil {
+		t.Fatal("no child SA installed")
+	}
+	if child.ResponderSPI != res.childResponderSPI {
+		t.Fatalf("responder SPI mismatch: %08x vs %08x", child.ResponderSPI, res.childResponderSPI)
+	}
+	if !bytes.Equal(child.Keys.EncrIR, res.childKeys.EncrIR) ||
+		!bytes.Equal(child.Keys.IntegRI, res.childKeys.IntegRI) {
+		t.Fatal("child SA key material disagrees across initiator/responder")
+	}
+}
+
+// TestOfflineHandshakePSKWrongKey proves a mismatched PSK is rejected at AUTH
+// verification: the initiator holds a different key than the responder, so the
+// responder's AUTH fails to verify and the session is not established.
+func TestOfflineHandshakePSKWrongKey(t *testing.T) {
+	initConn, respConn := transport.MemoryPair()
+
+	initSess := New(Config{
+		Server:          "mem:500",
+		LocalID:         WireID{Type: uint8(ikemsg.IDTypeFQDN), Data: []byte("client.test")},
+		PSK:             []byte("client-key"),
+		Logger:          slog.New(slog.DiscardHandler),
+		RetransmitBase:  2 * time.Second,
+		RetransmitMax:   4 * time.Second,
+		RetransmitTries: 3,
+	})
+	initSess.conn = initConn
+
+	respDone := make(chan *responderResult, 1)
+	go func() { respDone <- runResponderPSK(respConn, []byte("server-key")) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := initSess.IKESAInit(ctx); err != nil {
+		t.Fatalf("IKESAInit: %v", err)
+	}
+	if err := initSess.IKEAuth(ctx); err == nil {
+		t.Fatal("IKEAuth accepted a mismatched PSK")
+	}
+	if initSess.Established() {
+		t.Fatal("session must not be established with a wrong PSK")
+	}
+	<-respDone // drain the responder goroutine (it fails on the initiator AUTH)
+}
+
+// respondSAInit performs the responder half of IKE_SA_INIT on conn: it reads the
+// initiator's request, derives the IKE SA into rs (Responder role), sends the
+// response, and returns the verbatim request/response datagrams and the initiator
+// nonce — the inputs the IKE_AUTH signed octets need. nr is the fixed responder
+// nonce the caller supplies so it can recompute the same octets.
+func respondSAInit(ctx context.Context, conn transport.Conn, rs *Session, nr []byte) (raw1, realMessage2, ni []byte, err error) {
+	raw1, err = conn.Recv(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	m1, err := ikemsg.Parse(raw1)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var keiData []byte
+	var keiGroup uint16
+	for _, p := range m1.Payloads {
+		switch v := p.(type) {
+		case *ikemsg.KEPayload:
+			keiData = v.Data
+			keiGroup = v.Group
+		case *ikemsg.NoncePayload:
+			ni = v.Data
+		}
+	}
+	respDH, err := ikesa.NewDH(keiGroup)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	shared, err := respDH.Shared(keiData)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var respSPIBuf [8]byte
+	rand.Read(respSPIBuf[:])
+	respSPI := binary.BigEndian.Uint64(respSPIBuf[:])
+
+	rs.initiatorSPI = m1.InitiatorSPI
+	rs.responderSPI = respSPI
+	rs.ikeSA = &ikesa.IKESA{}
+	if err := rs.ikeSA.Derive(ikesa.Responder, m1.InitiatorSPI, respSPI, ni, nr, shared); err != nil {
+		return nil, nil, nil, err
+	}
+
+	resp1 := &ikemsg.Message{
+		InitiatorSPI: m1.InitiatorSPI,
+		ResponderSPI: respSPI,
+		Exchange:     ikemsg.ExchangeIKESAInit,
+		Flags:        ikemsg.FlagResponse,
+		Payloads: ikemsg.Payloads{
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposal(1, keiGroup)}},
+			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
+			&ikemsg.NoncePayload{Data: nr},
+		},
+	}
+	realMessage2, err = resp1.Marshal()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := conn.Send(ctx, realMessage2); err != nil {
+		return nil, nil, nil, err
+	}
+	return raw1, realMessage2, ni, nil
+}
+
+// runResponderPSK implements the PSK responder half: IKE_SA_INIT followed by a
+// single IKE_AUTH round-trip that verifies the initiator's shared-key AUTH and
+// replies with IDr, the responder's shared-key AUTH, SAr2, traffic selectors and
+// the CFG reply. A PSK mismatch is surfaced as an error in the returned result.
+func runResponderPSK(conn transport.Conn, psk []byte) *responderResult {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res := &responderResult{}
+	fail := func(err error) *responderResult { res.err = err; return res }
+
+	rs := New(Config{Logger: slog.New(slog.DiscardHandler)})
+	nr := bytes.Repeat([]byte{0x42}, 32)
+
+	raw1, realMessage2, ni, err := respondSAInit(ctx, conn, rs, nr)
+	if err != nil {
+		return fail(err)
+	}
+
+	// --- IKE_AUTH message 3: IDi, AUTH(PSK), SA2, TSi, TSr, CP ---
+	raw3, err := conn.Recv(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	hdr3, inner3, err := rs.decodeSK(raw3)
+	if err != nil {
+		return fail(err)
+	}
+	var (
+		idi      *ikemsg.IDiPayload
+		initAuth *ikemsg.AuthPayload
+	)
+	for _, p := range inner3 {
+		switch v := p.(type) {
+		case *ikemsg.IDiPayload:
+			idi = v
+		case *ikemsg.AuthPayload:
+			initAuth = v
+		}
+	}
+	if idi == nil || initAuth == nil {
+		return fail(errFail("PSK message 3 missing IDi or AUTH"))
+	}
+	if initAuth.Method != iauth.MethodSharedKeyMIC {
+		return fail(errFail("initiator AUTH method is not SharedKeyMIC"))
+	}
+	// Verify the initiator's shared-key AUTH (a wrong PSK fails here).
+	initSigned := iauth.SignedOctets(rs.ikeSA.PRF, raw1, nr, ikemsg.MarshalIDBody(idi.IDType, idi.Data), rs.ikeSA.SKpi)
+	if want := iauth.SharedSecretAuth(rs.ikeSA.PRF, psk, initSigned); !bytes.Equal(initAuth.Data, want) {
+		return fail(errFail("initiator PSK AUTH mismatch"))
+	}
+
+	// --- message 4: IDr, AUTH(PSK), SAr2, TSi, TSr, CP(reply) ---
+	idr := WireID{Type: uint8(ikemsg.IDTypeFQDN), Data: []byte("vpn.test")}
+	respSigned := iauth.SignedOctets(rs.ikeSA.PRF, realMessage2, ni, ikemsg.MarshalIDBody(ikemsg.IDType(idr.Type), idr.Data), rs.ikeSA.SKpr)
+	respAuth := iauth.SharedSecretAuth(rs.ikeSA.PRF, psk, respSigned)
+
+	var childSPIBuf [4]byte
+	rand.Read(childSPIBuf[:])
+	res.childResponderSPI = binary.BigEndian.Uint32(childSPIBuf[:])
+	res.childKeys = rs.ikeSA.DeriveChildKeys(ni, nr, espEncrKeyLen, espIntegKeyLen)
+
+	m4 := ikemsg.Payloads{
+		&ikemsg.IDrPayload{IDType: ikemsg.IDType(idr.Type), Data: idr.Data},
+		&ikemsg.AuthPayload{Method: iauth.MethodSharedKeyMIC, Data: respAuth},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, childSPIBuf[:])}},
+	}
+	appendTrafficSelectors(&m4, false)
+	ip := netip.MustParseAddr("10.10.0.77").As4()
+	mask := netip.MustParseAddr("255.255.255.0").As4()
+	m4 = append(m4, &ikemsg.ConfigPayload{
+		CfgType: ikemsg.ConfigReply,
+		Attributes: []ikemsg.ConfigAttr{
+			{Type: ikemsg.ConfigAttrInternalIP4Address, Value: ip[:]},
+			{Type: ikemsg.ConfigAttrInternalIP4Netmask, Value: mask[:]},
+		},
+	})
+	out4, err := rs.encodeSK(ikemsg.ExchangeIKEAuth, ikemsg.FlagResponse, hdr3.MessageID, m4)
+	if err != nil {
+		return fail(err)
+	}
+	if err := conn.Send(ctx, out4); err != nil {
 		return fail(err)
 	}
 	return res

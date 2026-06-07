@@ -1,8 +1,9 @@
 # ipsec2socks
 
 A single-tunnel SOCKS5 sidecar for [go-ipsec](../../README.md). It dials an
-**IKEv2-EAP-MSCHAPv2** VPN server, brings up the userspace ESP tunnel, and
-exposes it as a local **SOCKS5** proxy — so any SOCKS-aware program (`curl`,
+**IKEv2** VPN server (authenticating with **EAP-MSCHAPv2** or a **pre-shared
+key**), brings up the userspace ESP tunnel, and exposes it as a local **SOCKS5**
+proxy — so any SOCKS-aware program (`curl`,
 browsers, mihomo/sing-box, scrapers) can route traffic through the VPN with no
 root, no kernel TUN device, and no strongSwan daemon.
 
@@ -44,9 +45,10 @@ The proxy stays up until you press **Ctrl-C**, which sends a graceful IKE
 | Flag | Default | Description |
 |---|---|---|
 | `-server` | *(required)* | VPN server `host[:port]` (port defaults to 500). |
-| `-eap-user` | `$IPSEC_EAP_USER` | EAP-MSCHAPv2 username. **Required.** |
-| `-eap-pass` | `$IPSEC_EAP_PASS` | EAP-MSCHAPv2 password. **Required.** |
-| `-ca` | *(system roots)* | PEM file of CA certificate(s) trusted for the server chain. |
+| `-eap-user` | `$IPSEC_EAP_USER` | EAP-MSCHAPv2 username. Required for EAP — use `-eap-*` **or** `-psk`. |
+| `-eap-pass` | `$IPSEC_EAP_PASS` | EAP-MSCHAPv2 password. Required for EAP — use `-eap-*` **or** `-psk`. |
+| `-psk` | `$IPSEC_PSK` | Pre-shared key for PSK auth. Mutually exclusive with `-eap-*`. |
+| `-ca` | *(system roots)* | PEM file of CA certificate(s) trusted for the server chain (EAP only; unused with `-psk`). |
 | `-remote-id` | *(any)* | Expected server identity, matched against the certificate SAN (email / FQDN / IP). |
 | `-local-id` | *(none)* | Local IKE identity (IDi) announced to the server (email / FQDN / IP). With EAP-MSCHAPv2 the real identity is `-eap-user`; this is only a server-side policy selector. When unset an empty IDi is sent. |
 | `-listen` | `127.0.0.1:1080` | SOCKS5 listen address. |
@@ -66,6 +68,10 @@ Pass the EAP password via `$IPSEC_EAP_PASS` rather than `-eap-pass` so it does
 not show up in `ps` / shell history. `-eap-user`/`-eap-pass` override the
 environment when given.
 
+For **PSK** auth, pass the key via `$IPSEC_PSK` rather than `-psk` for the same
+reason. Supply exactly one of `-psk` or `-eap-user`/`-eap-pass`; with PSK no `-ca`
+is needed, since there is no server certificate.
+
 ## Name resolution
 
 `CONNECT` requests with a **domain name** are resolved through the tunnel using
@@ -82,9 +88,10 @@ locally.
   open SOCKS5 proxy on a public interface is an open relay. Bind only to
   `127.0.0.1` / `localhost`, or set `-socks-auth` and pass
   `-insecure-allow-public-bind` if you really mean to expose it.
-- Always supply `-ca` (and ideally `-remote-id`) so the server certificate
-  chain and identity are verified; without `-ca` the system trust roots are
-  used.
+- For **EAP**, always supply `-ca` (and ideally `-remote-id`) so the server
+  certificate chain and identity are verified; without `-ca` the system trust
+  roots are used. (PSK does not use a certificate; mutual trust comes from the
+  shared key.)
 
 ## Lifecycle
 

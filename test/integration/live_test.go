@@ -1,12 +1,18 @@
 //go:build e2e_server
 
 // Package integration holds the build-tagged live interop tests. They dial a
-// real IKEv2-EAP-MSCHAPv2 endpoint with operator-injected credentials and are
-// excluded from normal builds. Run with:
+// real IKEv2 endpoint with operator-injected credentials and are excluded from
+// normal builds. Run the EAP-MSCHAPv2 tests with:
 //
 //	IPSEC_SERVER=vpn.example.com:500 \
 //	IPSEC_EAP_USER=user IPSEC_EAP_PASS=secret \
 //	go test -tags e2e_server -v ./test/integration -run Live
+//
+// The PSK test instead needs IPSEC_PSK (and IPSEC_LOCAL_ID for the IDi the
+// gateway keys the PSK by; it defaults to client.test):
+//
+//	IPSEC_SERVER=vpn.example.com:500 IPSEC_PSK=secret \
+//	go test -tags e2e_server -v ./test/integration -run LivePSK
 //
 // Never iterate against a live endpoint for primitive debugging — a server may
 // rate-limit repeated failed handshakes. Use the offline KAT and handshake
@@ -58,6 +64,32 @@ func liveConfig(t *testing.T) ipsec.Config {
 			t.Fatal("no certs in IPSEC_CA")
 		}
 		cfg.RootCAs = pool
+	}
+	return cfg
+}
+
+// livePSKConfig builds a PSK (pre-shared key) live config. PSK auth carries no
+// EAP username and no certificate, so the IKE identity is the IDi — defaulted to
+// the FQDN the strongSwan rw-psk conn keys its PSK by (client.test).
+func livePSKConfig(t *testing.T) ipsec.Config {
+	t.Helper()
+	server := os.Getenv("IPSEC_SERVER")
+	psk := os.Getenv("IPSEC_PSK")
+	if server == "" || psk == "" {
+		t.Skip("set IPSEC_SERVER and IPSEC_PSK to run the live PSK test")
+	}
+	localID := os.Getenv("IPSEC_LOCAL_ID")
+	if localID == "" {
+		localID = "client.test"
+	}
+	cfg := ipsec.Config{
+		Server:  server,
+		LocalID: ipsec.FQDN(localID),
+		PSK:     psk,
+		Logger:  slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+	if id := os.Getenv("IPSEC_REMOTE_ID"); id != "" {
+		cfg.RemoteID = ipsec.FQDN(id)
 	}
 	return cfg
 }
@@ -201,6 +233,36 @@ func TestLiveHTTPGet(t *testing.T) {
 	}
 	defer client.Close()
 
+	t.Logf("exit IP via tunnel: %s", httpGetThroughTunnel(t, client))
+}
+
+// TestLivePSKHandshake dials the live endpoint with PSK auth (no EAP, no
+// certificate) and asserts the Child SA is installed and a CP address assigned,
+// then proves the data plane with an HTTP GET — the e2e gate for the PSK
+// IKE_AUTH path against a real strongSwan server.
+func TestLivePSKHandshake(t *testing.T) {
+	cfg := livePSKConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	client, err := ipsec.Dial(ctx, cfg)
+	if err != nil {
+		t.Fatalf("dial (PSK): %v", err)
+	}
+	defer client.Close()
+
+	if !client.LocalIP().IsValid() {
+		t.Fatal("no CP address assigned")
+	}
+	t.Logf("PSK tunnel up: localIP=%s dns=%v", client.LocalIP(), client.DNS())
+	t.Logf("PSK exit IP via tunnel: %s", httpGetThroughTunnel(t, client))
+}
+
+// httpGetThroughTunnel resolves and dials api.ipify.org over the tunnel and
+// returns the exit IP it reports, failing the test on any error or a
+// non-IP response. Shared by the EAP and PSK live data-plane checks.
+func httpGetThroughTunnel(t *testing.T, client *ipsec.Client) string {
+	t.Helper()
 	resolver := client.Resolver("")
 	httpClient := &http.Client{
 		Timeout: 20 * time.Second,
@@ -227,8 +289,8 @@ func TestLiveHTTPGet(t *testing.T) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 	exitIP := strings.TrimSpace(string(body))
-	t.Logf("exit IP via tunnel: %s", exitIP)
 	if net.ParseIP(exitIP) == nil {
 		t.Fatalf("unexpected ipify response: %q", exitIP)
 	}
+	return exitIP
 }

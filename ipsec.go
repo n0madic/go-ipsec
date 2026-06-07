@@ -110,8 +110,8 @@ func newClient(cfg Config) *Client {
 	return c
 }
 
-// Dial brings up a tunnel: IKE_SA_INIT, IKE_AUTH (EAP-MSCHAPv2), and the first
-// Child SA. It blocks until the Child SA is installed or ctx is cancelled.
+// Dial brings up a tunnel: IKE_SA_INIT, IKE_AUTH (EAP-MSCHAPv2 or PSK), and the
+// first Child SA. It blocks until the Child SA is installed or ctx is cancelled.
 func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -323,6 +323,7 @@ func toSessionConfig(cfg Config) session.Config {
 		RemoteID:         session.WireID{Type: cfg.RemoteID.idType(), Data: cfg.RemoteID.idData()},
 		EAPUser:          cfg.EAP.Username,
 		EAPPass:          cfg.EAP.Password,
+		PSK:              []byte(cfg.PSK),
 		RootCAs:          cfg.RootCAs,
 		MTU:              cfg.MTU,
 		Logger:           cfg.Logger,

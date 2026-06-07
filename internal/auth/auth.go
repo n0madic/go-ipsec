@@ -38,12 +38,14 @@ func SignedOctets(prf PRF, realMessage, peerNonce, idPrime, macKey []byte) []byt
 	return out
 }
 
-// MSKAuth computes the MSK-keyed AUTH value (RFC 7296 §2.16: EAP MSK used as the
-// shared secret of §2.15):
+// SharedSecretAuth computes the RFC 7296 §2.15 shared-secret AUTH value — the
+// "double-prf" construction shared by both authentication modes: with a
+// pre-shared key the secret is the PSK, and with EAP the secret is the derived
+// MSK (RFC 7296 §2.16 feeds the MSK into §2.15 as the shared secret):
 //
-//	AUTH = prf( prf(MSK, "Key Pad for IKEv2"), SignedOctets )
-func MSKAuth(prf PRF, msk, signedOctets []byte) []byte {
-	inner := prf(msk, keyPad)
+//	AUTH = prf( prf(secret, "Key Pad for IKEv2"), SignedOctets )
+func SharedSecretAuth(prf PRF, secret, signedOctets []byte) []byte {
+	inner := prf(secret, keyPad)
 	return prf(inner, signedOctets)
 }
 

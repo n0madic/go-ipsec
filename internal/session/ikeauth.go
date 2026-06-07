@@ -40,18 +40,74 @@ type Assigned struct {
 	DNS6 []netip.Addr
 }
 
-// IKEAuth runs the full IKE_AUTH exchange with EAP-MSCHAPv2 and installs the
-// first Child SA. It must be called after IKESAInit.
+// IKEAuth runs the IKE_AUTH exchange and installs the first Child SA. It
+// dispatches on the configured credential: a pre-shared key (PSK) authenticates
+// in a single round-trip, while EAP-MSCHAPv2 runs the multi-message EAP
+// conversation. It must be called after IKESAInit.
 func (s *Session) IKEAuth(ctx context.Context) error {
 	if s.ikeSA == nil {
 		return errors.New("session: IKEAuth before IKESAInit")
 	}
-	// Allocate our Child SA SPI.
+	if len(s.cfg.PSK) > 0 {
+		return s.ikeAuthPSK(ctx)
+	}
+	return s.ikeAuthEAP(ctx)
+}
+
+// allocChildSPI generates and records this client's first Child SA SPI, returning
+// the 4-byte value for the ESP proposal.
+func (s *Session) allocChildSPI() ([]byte, error) {
 	var spiBuf [4]byte
 	if _, err := rand.Read(spiBuf[:]); err != nil {
-		return err
+		return nil, err
 	}
 	s.childInitiatorSPI = binary.BigEndian.Uint32(spiBuf[:])
+	return spiBuf[:], nil
+}
+
+// ikeAuthPSK runs the PSK IKE_AUTH exchange: a single SK{IDi, AUTH, SA2, TSi, TSr,
+// CP} request carrying the shared-key AUTH up front (no EAP request), and the
+// responder's SK{IDr, AUTH, SAr2, TSi, TSr, CP} reply that proves it holds the
+// same PSK and installs the first Child SA.
+func (s *Session) ikeAuthPSK(ctx context.Context) error {
+	spi, err := s.allocChildSPI()
+	if err != nil {
+		return err
+	}
+
+	// IDi, the shared-key AUTH, the ESP proposal, full-tunnel selectors and the CFG
+	// request — everything the EAP path spreads across several messages, in one
+	// request because PSK needs no EAP round-trip. The child proposal still
+	// advertises both DH groups for a strict-PFS server (see ikeAuthEAP).
+	first := ikemsg.Payloads{
+		&ikemsg.IDiPayload{IDType: ikemsg.IDType(s.cfg.LocalID.Type), Data: s.cfg.LocalID.Data},
+		&ikemsg.AuthPayload{Method: auth.MethodSharedKeyMIC, Data: s.computeInitiatorAuth(s.cfg.PSK)},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalPFS(1, spi, preferredDHGroups...)}},
+	}
+	appendTrafficSelectors(&first, s.cfg.RequestIPv6)
+	buildCPRequest(&first, s.cfg.RequestIPv6)
+
+	resp, err := s.exchangeSK(ctx, ikemsg.ExchangeIKEAuth, s.messageID, first)
+	if err != nil {
+		return fmt.Errorf("session: IKE_AUTH (PSK): %w", err)
+	}
+	s.messageID++
+
+	// Surface a responder error notify (e.g. AUTHENTICATION_FAILED for a wrong PSK)
+	// before the generic AUTH-verification failure below.
+	if err := firstNotifyError(resp); err != nil {
+		return err
+	}
+	return s.handleFinalAuthResponse(resp, s.cfg.PSK)
+}
+
+// ikeAuthEAP runs the full IKE_AUTH exchange with EAP-MSCHAPv2 and installs the
+// first Child SA.
+func (s *Session) ikeAuthEAP(ctx context.Context) error {
+	spi, err := s.allocChildSPI()
+	if err != nil {
+		return err
+	}
 
 	// --- Message 3: IDi, SA2, TSi, TSr, CP(request); no AUTH → request EAP. ---
 	// The first Child SA carries no KE (it is keyed from the IKE SA, no PFS), but a
@@ -61,7 +117,7 @@ func (s *Session) IKEAuth(ctx context.Context) error {
 	// the unused DH transforms.
 	first := ikemsg.Payloads{
 		&ikemsg.IDiPayload{IDType: ikemsg.IDType(s.cfg.LocalID.Type), Data: s.cfg.LocalID.Data},
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalPFS(1, spiBuf[:], preferredDHGroups...)}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalPFS(1, spi, preferredDHGroups...)}},
 	}
 	appendTrafficSelectors(&first, s.cfg.RequestIPv6)
 	buildCPRequest(&first, s.cfg.RequestIPv6)
@@ -194,10 +250,13 @@ func (s *Session) handleAuthResponse(payloads ikemsg.Payloads) (eap.Packet, erro
 	return eapReq, nil
 }
 
-// handleFinalAuthResponse verifies the responder's MSK AUTH and installs the
-// Child SA + assigned configuration.
-func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, msk []byte) error {
+// handleFinalAuthResponse verifies the responder's shared-secret AUTH (keyed by
+// the EAP MSK or the PSK) and installs the Child SA + assigned configuration. The
+// EAP path already captured the responder's IDr from message 4; the PSK path
+// carries IDr in this single response, so it is captured here when present.
+func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, secret []byte) error {
 	var (
+		idr      *ikemsg.IDrPayload
 		authP    *ikemsg.AuthPayload
 		saP      *ikemsg.SAPayload
 		cp       *ikemsg.ConfigPayload
@@ -205,6 +264,8 @@ func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, msk []byte) 
 	)
 	for _, p := range payloads {
 		switch v := p.(type) {
+		case *ikemsg.IDrPayload:
+			idr = v
 		case *ikemsg.AuthPayload:
 			authP = v
 		case *ikemsg.SAPayload:
@@ -224,11 +285,18 @@ func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, msk []byte) 
 	if authP == nil {
 		return errors.New("session: final IKE_AUTH missing responder AUTH")
 	}
-	// Verify responder MSK AUTH over the responder signed octets.
+	// EAP set s.remoteIDr from message 4; PSK carries IDr in this response.
+	if idr != nil {
+		s.remoteIDr = WireID{Type: uint8(idr.IDType), Data: append([]byte(nil), idr.Data...)}
+	}
+	if s.remoteIDr.Type == 0 && len(s.remoteIDr.Data) == 0 {
+		return errors.New("session: IKE_AUTH response missing IDr")
+	}
+	// Verify the responder's shared-secret AUTH over the responder signed octets.
 	respSigned := s.responderSignedOctets(ikemsg.MarshalIDBody(ikemsg.IDType(s.remoteIDr.Type), s.remoteIDr.Data))
-	want := auth.MSKAuth(s.ikeSA.PRF, msk, respSigned)
+	want := auth.SharedSecretAuth(s.ikeSA.PRF, secret, respSigned)
 	if authP.Method != auth.MethodSharedKeyMIC || !constTimeEqual(authP.Data, want) {
-		return errors.New("session: responder MSK AUTH verification failed")
+		return errors.New("session: responder AUTH verification failed")
 	}
 
 	if saP == nil || len(saP.Proposals) == 0 || !isESPSelection(saP.Proposals[0]) {
@@ -257,10 +325,11 @@ func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, msk []byte) 
 	return nil
 }
 
-// computeInitiatorAuth builds the initiator's MSK-keyed AUTH value.
-func (s *Session) computeInitiatorAuth(msk []byte) []byte {
+// computeInitiatorAuth builds the initiator's shared-secret AUTH value over its
+// signed octets, keyed by the PSK or the EAP-derived MSK.
+func (s *Session) computeInitiatorAuth(secret []byte) []byte {
 	signed := s.initiatorSignedOctets()
-	return auth.MSKAuth(s.ikeSA.PRF, msk, signed)
+	return auth.SharedSecretAuth(s.ikeSA.PRF, secret, signed)
 }
 
 // initiatorSignedOctets = RealMessage1 | Nr | prf(SK_pi, IDi').

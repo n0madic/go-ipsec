@@ -1,4 +1,4 @@
-# Local strongSwan IKEv2-EAP-MSCHAPv2 server for go-ipsec interop testing.
+# Local strongSwan IKEv2 server (EAP-MSCHAPv2 + PSK conns) for go-ipsec interop testing.
 #
 #   docker compose up --build      # generates certs + serves UDP 500/4500
 #

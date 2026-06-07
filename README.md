@@ -34,12 +34,14 @@ and to route them into proxy-service rotation via a SOCKS5 sidecar
 
 ## Status
 
-**Working** for IKEv2-EAP-MSCHAPv2 over the fixed transform suite
-(AES-CBC-256 / PRF-HMAC-SHA2-256 / AUTH-HMAC-SHA2-256-128 / DH x25519 group 31,
-preferred, or MODP-2048 group 14, fallback). Implemented and exercised end-to-end:
+**Working** for IKEv2 with **EAP-MSCHAPv2** or **pre-shared key (PSK)**
+authentication, over the fixed transform suite (AES-CBC-256 / PRF-HMAC-SHA2-256 /
+AUTH-HMAC-SHA2-256-128 / DH x25519 group 31, preferred, or MODP-2048 group 14,
+fallback). Implemented and exercised end-to-end:
 
-- **IKE_SA_INIT** + **IKE_AUTH** with EAP-MSCHAPv2, certificate-chain and AUTH
-  payload verification.
+- **IKE_SA_INIT** + **IKE_AUTH** with either EAP-MSCHAPv2 (certificate-chain +
+  AUTH payload verification) or a pre-shared key (single-round mutual AUTH, no
+  certificate).
 - **NAT-T** — UDP-encapsulation on port 4500 (mandatory: a userspace client
   cannot send raw ESP), with NAT detection at IKE_SA_INIT.
 - A userspace **ESP data plane** — RFC 4303 framing with RFC 6479 anti-replay.
@@ -116,6 +118,19 @@ defer client.Close()
 conn, err := client.DialContext(ctx, "tcp", "93.184.216.34:80") // literal IP
 ```
 
+To authenticate with a **pre-shared key** instead of EAP, set `PSK` and leave
+`EAP` unset. No server certificate is involved, so `RootCAs` is unused; the IKE
+identities come from `LocalID` (IDi) and `RemoteID` (IDr):
+
+```go
+client, err := ipsec.Dial(ctx, ipsec.Config{
+    Server:   "vpn.example.com:500",
+    LocalID:  ipsec.FQDN("client.example.com"), // IDi
+    RemoteID: ipsec.FQDN("vpn.example.com"),     // expected IDr (optional)
+    PSK:      "a-strong-preshared-key",
+})
+```
+
 `Dial` blocks until the first Child SA is installed (IKE_SA_INIT → IKE_AUTH →
 CHILD_SA) or `ctx` is cancelled. After it returns, the tunnel is self-maintaining:
 DPD, rekey and auto-reconnect all run on background goroutines until `Close`.
@@ -160,6 +175,13 @@ ipsec2socks -server vpn.example.com:500 -ca ca.pem \
 curl --socks5-hostname 127.0.0.1:1080 https://example.com
 ```
 
+With a pre-shared key instead of EAP (mutually exclusive with `-eap-*`):
+
+```sh
+ipsec2socks -server vpn.example.com:500 -psk 'a-strong-preshared-key' \
+  -local-id client.example.com -listen 127.0.0.1:1080
+```
+
 > Use `--socks5-hostname` (not `--socks5`) so the hostname is resolved through
 > the tunnel and DNS does not leak.
 
@@ -175,8 +197,9 @@ The `Config` struct passed to `ipsec.Dial`:
 | `Server` | `string` | *(required)* | Responder endpoint `host:port`; port defaults to 500. |
 | `LocalID` | `Identity` | unset | Local IKE identity (IDi) announced to the server. |
 | `RemoteID` | `Identity` | unset | Expected server identity (IDr); when set, also matched against the certificate SANs. |
-| `EAP` | `EAPMSCHAPv2` | *(required)* | `{Username, Password}` for EAP-MSCHAPv2. |
-| `RootCAs` | `*x509.CertPool` | system roots | Trust anchors for the server certificate chain. |
+| `EAP` | `EAPMSCHAPv2` | *(one-of)* | `{Username, Password}` for EAP-MSCHAPv2. Set this **or** `PSK`. |
+| `PSK` | `string` | *(one-of)* | Pre-shared key for PSK auth (RFC 7296 §2.15). Set this **or** `EAP`. |
+| `RootCAs` | `*x509.CertPool` | system roots | Trust anchors for the server certificate chain (EAP only; unused with PSK). |
 | `Transport` | `PacketDialer` | host UDP | Injects the underlying packet socket (e.g. for `mihomo`). |
 | `MTU` | `uint32` | `1400` | Inner tunnel MTU hint (clamped by the data plane). |
 | `Logger` | `*slog.Logger` | discard | Structured diagnostics sink. |
@@ -192,6 +215,9 @@ The `Config` struct passed to `ipsec.Dial`:
 | `ReconnectBackoffBase` | `time.Duration` | `1s` | Initial redial backoff. |
 | `ReconnectBackoffMax` | `time.Duration` | `30s` | Capped redial backoff. |
 | `ReconnectAttemptTimeout` | `time.Duration` | `20s` | Per-attempt redial timeout. |
+
+Authentication is **one-of**: set `EAP` (username + password) **or** `PSK`, never
+both — supplying both, or neither, is a config-time error.
 
 Duration knobs default when `<= 0`. `RequestIPv6` and `AutoReconnect` are
 tri-state pointers: `nil` or a pointer to `true` enables the feature; only a
@@ -226,6 +252,10 @@ The zero `Identity` is "unset". For `RemoteID` (IDr) that means "accept whatever
 the server presents", subject to certificate trust. With EAP-MSCHAPv2 the real
 client identity is the EAP username; `LocalID` is only a server-side policy
 selector and may be left unset (an empty IDi is sent).
+
+With **PSK** there is no EAP username, so `LocalID` (IDi) and `RemoteID` (IDr)
+carry the IKE identities directly. Many PSK gateways select the key by the IDi, so
+set `LocalID`; `RemoteID`, when set, is the IDr the server must present.
 
 ## DNS through the tunnel
 
@@ -302,7 +332,7 @@ by a userspace `PacketTunnel` into a `go-tun2net` netstack:
 | `internal/ikemsg` | IKEv2 message + payload codec (own implementation). |
 | `internal/ikesa` | IKE SA crypto: DH (x25519/MODP), key derivation, Child SA keys. |
 | `internal/eap` | EAP-MSCHAPv2 and MSK derivation. |
-| `internal/auth` | AUTH payload + certificate-chain verification. |
+| `internal/auth` | AUTH payload (shared-key + certificate) + certificate-chain verification. |
 | `internal/esp` | ESP framing (RFC 4303) + anti-replay window (RFC 6479). |
 | `internal/session` | IKE session state machine: init, auth, informational, rekey, NAT-T. |
 | `internal/natt` | NAT-T detection and UDP encapsulation. |

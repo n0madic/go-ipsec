@@ -1,5 +1,5 @@
 // Package session drives the IKEv2 initiator state machine: IKE_SA_INIT,
-// IKE_AUTH (EAP-MSCHAPv2), Child SA install, and the INFORMATIONAL lifecycle
+// IKE_AUTH (EAP-MSCHAPv2 or PSK), Child SA install, and the INFORMATIONAL lifecycle
 // (DPD, rekey, DELETE). It owns all IKE SA state on a single goroutine; the
 // data plane (ESP) runs alongside but is keyed from material this package
 // derives.
@@ -38,6 +38,7 @@ type Config struct {
 	RemoteID WireID
 	EAPUser  string
 	EAPPass  string
+	PSK      []byte
 	RootCAs  *x509.CertPool
 	Dialer   transport.DialFunc
 	MTU      uint32
