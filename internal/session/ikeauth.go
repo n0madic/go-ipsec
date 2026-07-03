@@ -325,13 +325,9 @@ func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, secret []byt
 	// route full-tunnel, so a narrowed selector means traffic outside it is dropped
 	// by the gateway with no other client-side signal — surface it.
 	s.warnNarrowedTS("IKE_AUTH", tsi, tsr)
-	respSPI := prop.SPI
-	if len(respSPI) != 4 {
-		return fmt.Errorf("session: responder ESP SPI length %d", len(respSPI))
-	}
 	s.child = &ChildSA{
 		InitiatorSPI: s.childInitiatorSPI,
-		ResponderSPI: binary.BigEndian.Uint32(respSPI),
+		ResponderSPI: binary.BigEndian.Uint32(prop.SPI),
 		Suite:        suite.id,
 		Keys:         s.ikeSA.DeriveChildKeys(s.nonceI, s.nonceR, suite.encrKeyLen, suite.integKeyLen),
 	}
