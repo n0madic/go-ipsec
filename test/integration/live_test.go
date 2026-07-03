@@ -216,6 +216,40 @@ func TestLiveCipherSuites(t *testing.T) {
 	}
 }
 
+// TestLiveIKECipherSuites proves each negotiable IKE SA envelope suite live:
+// per suite it pins Config.IKECipherSuites to that single value — so the
+// strongSwan server can only narrow the IKE_SA_INIT offer to it (any other
+// selection fails the handshake) — and then routes an HTTP GET through the
+// tunnel, which exercises the SK{} envelope end to end (IKE_AUTH, CP, DPD
+// acks all ride it). Without the pin the server would always narrow to the
+// most-preferred suite and the ChaCha/CBC envelopes would never be exercised
+// on the wire. Sequential by design: each subtest owns the tunnel.
+func TestLiveIKECipherSuites(t *testing.T) {
+	suites := []ipsec.CipherSuite{
+		ipsec.CipherSuiteAESGCM256,
+		ipsec.CipherSuiteChaCha20Poly1305,
+		ipsec.CipherSuiteAESCBC256SHA256,
+	}
+	for _, suite := range suites {
+		t.Run(suite.String(), func(t *testing.T) {
+			cfg := liveConfig(t)
+			cfg.IKECipherSuites = []ipsec.CipherSuite{suite}
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			client, err := ipsec.Dial(ctx, cfg)
+			if err != nil {
+				t.Fatalf("dial with IKE %v pinned: %v", suite, err)
+			}
+			defer client.Close()
+			if !client.LocalIP().IsValid() {
+				t.Fatal("no CP address assigned")
+			}
+			t.Logf("IKE %v exit IP via tunnel: %s", suite, httpGetThroughTunnel(t, client))
+		})
+	}
+}
+
 // TestLiveDiag connects a raw TCP socket through the tunnel and dumps the
 // gVisor stack drop counters to pinpoint where inbound packets are lost.
 func TestLiveDiag(t *testing.T) {

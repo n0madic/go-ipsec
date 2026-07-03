@@ -29,19 +29,30 @@ import (
 
 // TestOfflineHandshake drives the full initiator state machine
 // (IKE_SA_INIT + IKE_AUTH + EAP-MSCHAPv2 + Child SA) against a cooperating
-// in-memory responder built from the same primitives, once per negotiable ESP
-// suite (the responder narrows the client's three-proposal offer to it). It
-// proves the state machine reaches "established", records the selected suite,
-// and that both ends derive identical Child SA keys of that suite's lengths —
-// the Phase 1 offline gate, with zero live dials.
+// in-memory responder built from the same primitives — once per negotiable ESP
+// suite (under the default GCM IKE envelope) and once per negotiable IKE suite
+// (with the ESP suite pinned to GCM), the responder narrowing the client's
+// multi-proposal offers accordingly. It proves the state machine reaches
+// "established", records the selected suites, and that both ends derive
+// identical Child SA keys of the ESP suite's lengths — the offline gate, with
+// zero live dials. The EAP conversation running inside the SK{} envelope also
+// exercises multiple AEAD IVs per IKE SA for the AEAD IKE suites.
 func TestOfflineHandshake(t *testing.T) {
 	for _, id := range []esp.Suite{esp.SuiteAESGCM256, esp.SuiteChaCha20Poly1305, esp.SuiteAESCBC256SHA256} {
 		suite := mustSuite(t, id)
-		t.Run(suite.name(), func(t *testing.T) { testOfflineHandshake(t, suite) })
+		t.Run("esp-"+suite.name(), func(t *testing.T) {
+			testOfflineHandshake(t, suite, mustIKESuite(t, ikesa.SuiteAESGCM256))
+		})
+	}
+	for _, id := range []ikesa.Suite{ikesa.SuiteAESGCM256, ikesa.SuiteChaCha20Poly1305, ikesa.SuiteAESCBC256SHA256} {
+		ike := mustIKESuite(t, id)
+		t.Run("ike-"+ike.name(), func(t *testing.T) {
+			testOfflineHandshake(t, mustSuite(t, esp.SuiteAESGCM256), ike)
+		})
 	}
 }
 
-func testOfflineHandshake(t *testing.T, suite espSuite) {
+func testOfflineHandshake(t *testing.T, suite espSuite, ike ikeSuite) {
 	const username, password = "User", "clientPass"
 	initConn, respConn := transport.MemoryPair()
 
@@ -66,7 +77,7 @@ func testOfflineHandshake(t *testing.T, suite espSuite) {
 
 	respDone := make(chan *responderResult, 1)
 	go func() {
-		res := runResponder(t, respConn, username, password, leaf, leafKey, suite)
+		res := runResponder(t, respConn, username, password, leaf, leafKey, suite, ike)
 		respDone <- res
 	}()
 
@@ -75,6 +86,9 @@ func testOfflineHandshake(t *testing.T, suite espSuite) {
 
 	if err := initSess.IKESAInit(ctx); err != nil {
 		t.Fatalf("IKESAInit: %v", err)
+	}
+	if initSess.ikeSA.Suite != ike.id {
+		t.Fatalf("negotiated IKE suite = %v, want %v", initSess.ikeSA.Suite, ike.id)
 	}
 	if err := initSess.IKEAuth(ctx); err != nil {
 		t.Fatalf("IKEAuth: %v", err)
@@ -125,9 +139,10 @@ type responderResult struct {
 }
 
 // runResponder implements the responder half of the handshake, narrowing the
-// client's multi-suite ESP offer to the given suite. It uses a Responder-role
-// Session purely for its encodeSK/decodeSK helpers.
-func runResponder(t *testing.T, conn transport.Conn, username, password string, leaf *x509.Certificate, leafKey *rsa.PrivateKey, suite espSuite) *responderResult {
+// client's multi-suite ESP offer to the given ESP suite and its multi-suite
+// IKE offer to the given IKE suite. It uses a Responder-role Session purely
+// for its encodeSK/decodeSK helpers.
+func runResponder(t *testing.T, conn transport.Conn, username, password string, leaf *x509.Certificate, leafKey *rsa.PrivateKey, suite espSuite, ike ikeSuite) *responderResult {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -137,61 +152,9 @@ func runResponder(t *testing.T, conn transport.Conn, username, password string, 
 	rs := New(Config{Logger: slog.New(slog.DiscardHandler)})
 
 	// --- IKE_SA_INIT ---
-	raw1, err := conn.Recv(ctx)
-	if err != nil {
-		return fail(err)
-	}
-	m1, err := ikemsg.Parse(raw1)
-	if err != nil {
-		return fail(err)
-	}
-	var keiData, ni []byte
-	var keiGroup uint16
-	for _, p := range m1.Payloads {
-		switch v := p.(type) {
-		case *ikemsg.KEPayload:
-			keiData = v.Data
-			keiGroup = v.Group
-		case *ikemsg.NoncePayload:
-			ni = v.Data
-		}
-	}
-	respDH, err := ikesa.NewDH(keiGroup)
-	if err != nil {
-		return fail(err)
-	}
 	nr := bytes.Repeat([]byte{0x42}, 32)
-	shared, err := respDH.Shared(keiData)
+	raw1, realMessage2, ni, err := respondSAInit(ctx, conn, rs, nr, ike)
 	if err != nil {
-		return fail(err)
-	}
-	var respSPIBuf [8]byte
-	rand.Read(respSPIBuf[:])
-	respSPI := binary.BigEndian.Uint64(respSPIBuf[:])
-
-	rs.initiatorSPI = m1.InitiatorSPI
-	rs.responderSPI = respSPI
-	rs.ikeSA = &ikesa.IKESA{}
-	if err := rs.ikeSA.Derive(ikesa.Responder, m1.InitiatorSPI, respSPI, ni, nr, shared); err != nil {
-		return fail(err)
-	}
-
-	resp1 := &ikemsg.Message{
-		InitiatorSPI: m1.InitiatorSPI,
-		ResponderSPI: respSPI,
-		Exchange:     ikemsg.ExchangeIKESAInit,
-		Flags:        ikemsg.FlagResponse,
-		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposal(1, keiGroup)}},
-			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
-			&ikemsg.NoncePayload{Data: nr},
-		},
-	}
-	realMessage2, err := resp1.Marshal()
-	if err != nil {
-		return fail(err)
-	}
-	if err := conn.Send(ctx, realMessage2); err != nil {
 		return fail(err)
 	}
 
@@ -448,11 +411,12 @@ func TestOfflineHandshakePSKWrongKey(t *testing.T) {
 }
 
 // respondSAInit performs the responder half of IKE_SA_INIT on conn: it reads the
-// initiator's request, derives the IKE SA into rs (Responder role), sends the
-// response, and returns the verbatim request/response datagrams and the initiator
-// nonce — the inputs the IKE_AUTH signed octets need. nr is the fixed responder
-// nonce the caller supplies so it can recompute the same octets.
-func respondSAInit(ctx context.Context, conn transport.Conn, rs *Session, nr []byte) (raw1, realMessage2, ni []byte, err error) {
+// initiator's request, derives the IKE SA into rs (Responder role, the given
+// IKE suite), sends the response narrowed to that suite, and returns the
+// verbatim request/response datagrams and the initiator nonce — the inputs the
+// IKE_AUTH signed octets need. nr is the fixed responder nonce the caller
+// supplies so it can recompute the same octets.
+func respondSAInit(ctx context.Context, conn transport.Conn, rs *Session, nr []byte, ike ikeSuite) (raw1, realMessage2, ni []byte, err error) {
 	raw1, err = conn.Recv(ctx)
 	if err != nil {
 		return nil, nil, nil, err
@@ -487,7 +451,7 @@ func respondSAInit(ctx context.Context, conn transport.Conn, rs *Session, nr []b
 	rs.initiatorSPI = m1.InitiatorSPI
 	rs.responderSPI = respSPI
 	rs.ikeSA = &ikesa.IKESA{}
-	if err := rs.ikeSA.Derive(ikesa.Responder, m1.InitiatorSPI, respSPI, ni, nr, shared); err != nil {
+	if err := rs.ikeSA.Derive(ike.id, ikesa.Responder, m1.InitiatorSPI, respSPI, ni, nr, shared); err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -497,7 +461,7 @@ func respondSAInit(ctx context.Context, conn transport.Conn, rs *Session, nr []b
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagResponse,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposal(1, keiGroup)}},
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, ike, nil, keiGroup)}},
 			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
 			&ikemsg.NoncePayload{Data: nr},
 		},
@@ -512,10 +476,17 @@ func respondSAInit(ctx context.Context, conn transport.Conn, rs *Session, nr []b
 	return raw1, realMessage2, ni, nil
 }
 
-// cbcSuite returns the AES-CBC-256+HMAC suite row for scripted responders that
-// run outside a *testing.T context (goroutines).
+// cbcSuite returns the AES-CBC-256+HMAC ESP suite row for scripted responders
+// that run outside a *testing.T context (goroutines).
 func cbcSuite() espSuite {
 	s, _ := espSuiteByID(esp.SuiteAESCBC256SHA256)
+	return s
+}
+
+// gcmIKESuite returns the AES-GCM-256 IKE suite row (the default preference)
+// for scripted responders that run outside a *testing.T context (goroutines).
+func gcmIKESuite() ikeSuite {
+	s, _ := ikeSuiteByID(ikesa.SuiteAESGCM256)
 	return s
 }
 
@@ -533,7 +504,7 @@ func runResponderPSK(conn transport.Conn, psk []byte, suite espSuite, mangle fun
 	rs := New(Config{Logger: slog.New(slog.DiscardHandler)})
 	nr := bytes.Repeat([]byte{0x42}, 32)
 
-	raw1, realMessage2, ni, err := respondSAInit(ctx, conn, rs, nr)
+	raw1, realMessage2, ni, err := respondSAInit(ctx, conn, rs, nr, gcmIKESuite())
 	if err != nil {
 		return fail(err)
 	}
@@ -774,60 +745,9 @@ func eapSuccessSkipResponder(conn transport.Conn, leaf *x509.Certificate, leafKe
 	defer cancel()
 	rs := New(Config{Logger: slog.New(slog.DiscardHandler)})
 
-	raw1, err := conn.Recv(ctx)
-	if err != nil {
-		return
-	}
-	m1, err := ikemsg.Parse(raw1)
-	if err != nil {
-		return
-	}
-	var keiData, ni []byte
-	var keiGroup uint16
-	for _, p := range m1.Payloads {
-		switch v := p.(type) {
-		case *ikemsg.KEPayload:
-			keiData = v.Data
-			keiGroup = v.Group
-		case *ikemsg.NoncePayload:
-			ni = v.Data
-		}
-	}
-	respDH, err := ikesa.NewDH(keiGroup)
-	if err != nil {
-		return
-	}
 	nr := bytes.Repeat([]byte{0x42}, 32)
-	shared, err := respDH.Shared(keiData)
+	_, realMessage2, ni, err := respondSAInit(ctx, conn, rs, nr, gcmIKESuite())
 	if err != nil {
-		return
-	}
-	var respSPIBuf [8]byte
-	rand.Read(respSPIBuf[:])
-	respSPI := binary.BigEndian.Uint64(respSPIBuf[:])
-	rs.initiatorSPI = m1.InitiatorSPI
-	rs.responderSPI = respSPI
-	rs.ikeSA = &ikesa.IKESA{}
-	if err := rs.ikeSA.Derive(ikesa.Responder, m1.InitiatorSPI, respSPI, ni, nr, shared); err != nil {
-		return
-	}
-
-	resp1 := &ikemsg.Message{
-		InitiatorSPI: m1.InitiatorSPI,
-		ResponderSPI: respSPI,
-		Exchange:     ikemsg.ExchangeIKESAInit,
-		Flags:        ikemsg.FlagResponse,
-		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposal(1, keiGroup)}},
-			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
-			&ikemsg.NoncePayload{Data: nr},
-		},
-	}
-	realMessage2, err := resp1.Marshal()
-	if err != nil {
-		return
-	}
-	if err := conn.Send(ctx, realMessage2); err != nil {
 		return
 	}
 
@@ -984,7 +904,7 @@ func cookieResponder(conn transport.Conn, cookie []byte) error {
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagResponse,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposal(1, keiGroup)}},
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
 			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
 			&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0x42}, 32)},
 		},
@@ -1070,7 +990,7 @@ func dropFirstSAInitResponder(conn transport.Conn) error {
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagResponse,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposal(1, keiGroup)}},
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
 			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
 			&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0x42}, 32)},
 		},
@@ -1189,7 +1109,7 @@ func invalidKEResponder(conn transport.Conn) error {
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagResponse,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposal(1, keiGroup)}},
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
 			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
 			&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0x42}, 32)},
 		},
@@ -1440,7 +1360,7 @@ func invalidKEThenCookieResponder(conn transport.Conn) error {
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagResponse,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposal(1, keiGroup)}},
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
 			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
 			&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0x42}, 32)},
 		},
@@ -1522,6 +1442,132 @@ func makeTestCert(t *testing.T, dns string) (*x509.Certificate, *rsa.PrivateKey,
 	roots := x509.NewCertPool()
 	roots.AddCert(ca)
 	return leaf, leafKey, roots
+}
+
+// saInitOnlyResponder answers a single IKE_SA_INIT with a complete response
+// whose narrowed proposal (GCM by default) is first passed through mangle,
+// then exits — the negative-path tests fail in handleSAInitResponse before
+// IKE_AUTH begins.
+func saInitOnlyResponder(conn transport.Conn, mangle func(*ikemsg.Proposal)) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	raw1, err := conn.Recv(ctx)
+	if err != nil {
+		return err
+	}
+	m1, err := ikemsg.Parse(raw1)
+	if err != nil {
+		return err
+	}
+	var keiData []byte
+	var keiGroup uint16
+	for _, p := range m1.Payloads {
+		if v, ok := p.(*ikemsg.KEPayload); ok {
+			keiData = v.Data
+			keiGroup = v.Group
+		}
+	}
+	respDH, err := ikesa.NewDH(keiGroup)
+	if err != nil {
+		return err
+	}
+	if _, err := respDH.Shared(keiData); err != nil {
+		return err
+	}
+	prop := buildIKEProposalForSuite(1, gcmIKESuite(), nil, keiGroup)
+	if mangle != nil {
+		mangle(&prop)
+	}
+	var spiBuf [8]byte
+	rand.Read(spiBuf[:])
+	out, err := (&ikemsg.Message{
+		InitiatorSPI: m1.InitiatorSPI,
+		ResponderSPI: binary.BigEndian.Uint64(spiBuf[:]),
+		Exchange:     ikemsg.ExchangeIKESAInit,
+		Flags:        ikemsg.FlagResponse,
+		Payloads: ikemsg.Payloads{
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{prop}},
+			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
+			&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0x42}, 32)},
+		},
+	}).Marshal()
+	if err != nil {
+		return err
+	}
+	return conn.Send(ctx, out)
+}
+
+// newSAInitOnlySession builds an initiator session over a fresh memory pair
+// for the IKE_SA_INIT negative tests, optionally restricting the enabled IKE
+// suites.
+func newSAInitOnlySession(ikeSuites []ikesa.Suite) (*Session, transport.Conn) {
+	initConn, respConn := transport.MemoryPair()
+	s := New(Config{
+		Server:          "mem:500",
+		LocalID:         WireID{Type: uint8(ikemsg.IDTypeRFC822), Data: []byte("user@example.com")},
+		EAPUser:         "u",
+		EAPPass:         []byte("p"),
+		IKESuites:       ikeSuites,
+		Logger:          slog.New(slog.DiscardHandler),
+		RetransmitBase:  time.Second,
+		RetransmitMax:   2 * time.Second,
+		RetransmitTries: 3,
+	})
+	s.conn = initConn
+	return s, respConn
+}
+
+// TestIKESAInitDisabledSuiteRejected pins the enabled-suite gate for the IKE
+// envelope: the client restricts the offer to CBC via Config.IKESuites, but
+// the responder answers with a GCM selection. IKE_SA_INIT must fail — a suite
+// the operator disabled must never key the envelope, even if the server picked
+// it.
+func TestIKESAInitDisabledSuiteRejected(t *testing.T) {
+	initSess, respConn := newSAInitOnlySession([]ikesa.Suite{ikesa.SuiteAESCBC256SHA256})
+
+	done := make(chan error, 1)
+	go func() { done <- saInitOnlyResponder(respConn, nil) }() // narrows to GCM
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := initSess.IKESAInit(ctx)
+	if err == nil {
+		t.Fatal("IKE_SA_INIT accepted an IKE suite the config disabled")
+	}
+	if !strings.Contains(err.Error(), "unsupported or ambiguous IKE proposal") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rerr := <-done; rerr != nil {
+		t.Fatalf("responder: %v", rerr)
+	}
+}
+
+// TestIKESAInitAmbiguousSelectionRejected: a responder "selection" that still
+// carries two ENCR alternatives leaves the SKEYSEED split undefined, so
+// IKE_SA_INIT must reject it instead of guessing.
+func TestIKESAInitAmbiguousSelectionRejected(t *testing.T) {
+	initSess, respConn := newSAInitOnlySession(nil)
+
+	ambiguous := func(p *ikemsg.Proposal) {
+		p.Transforms = append(p.Transforms,
+			ikemsg.Transform{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_CHACHA20_POLY1305})
+	}
+	done := make(chan error, 1)
+	go func() { done <- saInitOnlyResponder(respConn, ambiguous) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := initSess.IKESAInit(ctx)
+	if err == nil {
+		t.Fatal("IKE_SA_INIT accepted an ambiguous two-ENCR selection")
+	}
+	if !strings.Contains(err.Error(), "unsupported or ambiguous IKE proposal") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rerr := <-done; rerr != nil {
+		t.Fatalf("responder: %v", rerr)
+	}
 }
 
 // TestSAInitCookieBounds: RFC 7296 §2.6 caps COOKIE notification data at 64

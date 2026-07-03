@@ -528,8 +528,10 @@ func (s *Session) initiateIKERekey(ctx context.Context) error {
 
 	var spi [8]byte
 	binary.BigEndian.PutUint64(spi[:], newSPIi)
+	// Offer the full enabled IKE suite table again (a rekey may migrate the
+	// envelope to a more preferred suite the server has since enabled).
 	inner := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalSPI(1, spi[:], dh.Group)}},
+		&ikemsg.SAPayload{Proposals: buildIKEProposalsSPI(spi[:], s.enabledIKESuites(), dh.Group)},
 		&ikemsg.NoncePayload{Data: ni},
 		&ikemsg.KEPayload{Group: dh.Group, Data: dh.Public},
 	}
@@ -552,9 +554,20 @@ func (s *Session) initiateIKERekey(ctx context.Context) error {
 // completeIKERekey finishes an IKE SA rekey we initiated: derive the new SA,
 // DELETE the old SA under the old SA, then cut over.
 func (s *Session) completeIKERekey(ctx context.Context, inner ikemsg.Payloads, p *pendingExchange) error {
-	prop, nr, ker, err := ikeRekeyPayloads(inner)
+	saP, nr, ker, err := ikeRekeyPayloads(inner)
 	if err != nil {
 		return err
+	}
+	if len(saP.Proposals) == 0 {
+		return errors.New("session: IKE rekey response carries no proposal")
+	}
+	// The response must be a strict narrowed SELECTION of one enabled suite —
+	// the suite determines the SKEYSEED split for the new SA, so an ambiguous
+	// echo would leave the key lengths undefined (mirrors childRekeyResponse).
+	prop := saP.Proposals[0]
+	suite, ok := selectedIKESuite(prop, s.enabledIKESuites())
+	if !ok || len(prop.SPI) != 8 {
+		return fmt.Errorf("session: IKE rekey response selected an unsupported or ambiguous proposal (%s)", describeProposals(saP))
 	}
 	newSPIr := binary.BigEndian.Uint64(prop.SPI)
 	// The responder must answer in the group we offered (the established IKE group).
@@ -565,7 +578,7 @@ func (s *Session) completeIKERekey(ctx context.Context, inner ikemsg.Payloads, p
 	if err != nil {
 		return fmt.Errorf("session: IKE rekey DH: %w", err)
 	}
-	newIKE, err := ikesa.DeriveRekeyIKE(s.ikeSA.SKd, ikesa.Initiator, p.ike.newSPIi, newSPIr, p.ike.ni, nr, shared)
+	newIKE, err := ikesa.DeriveRekeyIKE(suite.id, s.ikeSA.SKd, ikesa.Initiator, p.ike.newSPIi, newSPIr, p.ike.ni, nr, shared)
 	if err != nil {
 		return err
 	}
@@ -574,7 +587,7 @@ func (s *Session) completeIKERekey(ctx context.Context, inner ikemsg.Payloads, p
 		s.log.Debug("IKE rekey: old-SA DELETE failed", "err", err)
 	}
 	s.swapIKE(newIKE, p.ike.newSPIi, newSPIr)
-	s.log.Info("IKE SA rekeyed (initiator)")
+	s.log.Info("IKE SA rekeyed (initiator)", "suite", suite.name())
 	return nil
 }
 
@@ -582,19 +595,34 @@ func (s *Session) completeIKERekey(ctx context.Context, inner ikemsg.Payloads, p
 // whether the request arrived under the superseded IKE SA (rekey grace window),
 // selecting the matching responder-dedup slot.
 func (s *Session) handleIKERekeyRequest(ctx context.Context, hdr *ikemsg.Message, inner ikemsg.Payloads, dec *ikeCtx, viaOld bool) error {
-	prop, ni, kei, err := ikeRekeyPayloads(inner)
+	saP, ni, kei, err := ikeRekeyPayloads(inner)
 	if err != nil {
 		// Cache an error response so retransmits are answered, not reprocessed.
 		s.sendNotifyResponse(ctx, dec, hdr.MessageID, viaOld, ikemsg.ProtocolNone, ikemsg.NotifyNoProposalChosen, nil, "IKE rekey: no proposal chosen")
 		return err
 	}
-	// Honor the peer's KE group when we run it and the proposal advertises it;
-	// otherwise tell it which group we accept (RFC 7296 §1.3) so it can retry.
+	// Honor the peer's KE group when we run it; otherwise tell it which group
+	// we accept (RFC 7296 §1.3) so it can retry.
 	group := kei.Group
-	if !supportedDHGroup(group) || !proposalHasDHGroup(prop, group) {
+	if !supportedDHGroup(group) {
 		s.sendInvalidKEPayload(ctx, dec, hdr.MessageID, viaOld)
 		s.log.Debug("declined server IKE rekey: unsupported KE group", "group", group)
 		return nil
+	}
+	// Pick our most-preferred enabled suite among the offered proposals; the
+	// matched proposal must also advertise the KE group (the DH exchange may
+	// only run against a proposal that offered it). A suite matching only
+	// outside the group constraint draws INVALID_KE_PAYLOAD so the peer can
+	// retry; no suite at all draws NO_PROPOSAL_CHOSEN (mirrors the Child path).
+	prop, suite, ok := selectIKEProposal(saP, s.enabledIKESuites(), group)
+	if !ok {
+		if _, _, okSansGroup := selectIKEProposal(saP, s.enabledIKESuites(), 0); okSansGroup {
+			s.sendInvalidKEPayload(ctx, dec, hdr.MessageID, viaOld)
+			s.log.Debug("declined server IKE rekey: KE group not offered by a matching proposal", "group", group)
+			return nil
+		}
+		s.sendNotifyResponse(ctx, dec, hdr.MessageID, viaOld, ikemsg.ProtocolNone, ikemsg.NotifyNoProposalChosen, nil, "IKE rekey: no proposal chosen")
+		return fmt.Errorf("session: no offered IKE proposal matches our suites (%s)", describeProposals(saP))
 	}
 	serverNewSPIi := binary.BigEndian.Uint64(prop.SPI)
 	newSPIr, err := randUint64()
@@ -619,15 +647,18 @@ func (s *Session) handleIKERekeyRequest(ctx context.Context, hdr *ikemsg.Message
 	// SA's SK_d and would diverge from the peer when the request arrives viaOld.
 	// Mirrors the Child-rekey path (which derives from dec.sa) and the response
 	// framing below, which already encodes under dec.sa.
-	newIKE, err := ikesa.DeriveRekeyIKE(dec.sa.SKd, ikesa.Responder, serverNewSPIi, newSPIr, ni, nr, shared)
+	newIKE, err := ikesa.DeriveRekeyIKE(suite.id, dec.sa.SKd, ikesa.Responder, serverNewSPIi, newSPIr, ni, nr, shared)
 	if err != nil {
 		return err
 	}
 
 	var spi [8]byte
 	binary.BigEndian.PutUint64(spi[:], newSPIr)
+	// Echo the selected proposal number, narrowed to the SELECTED suite (RFC
+	// 7296 §2.7) — not a rebuild of some fixed suite, which would desync the
+	// key schedule whenever the peer's preferred offer differs from ours.
 	resp := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalSPI(prop.Number, spi[:], dh.Group)}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(prop.Number, suite, spi[:], dh.Group)}},
 		&ikemsg.NoncePayload{Data: nr},
 		&ikemsg.KEPayload{Group: dh.Group, Data: dh.Public},
 	}
@@ -646,7 +677,7 @@ func (s *Session) handleIKERekeyRequest(ctx context.Context, hdr *ikemsg.Message
 	// Cut over to the new SA; the server will DELETE the old SA under the old
 	// SA, which we ack via the grace-decode path.
 	s.swapIKE(newIKE, serverNewSPIi, newSPIr)
-	s.log.Info("IKE SA rekeyed (responder)")
+	s.log.Info("IKE SA rekeyed (responder)", "suite", suite.name())
 	return nil
 }
 
@@ -692,36 +723,34 @@ func (s *Session) swapIKE(newIKE *ikesa.IKESA, spii, spir uint64) {
 	s.pending = nil // any old-SA pending is moot under the new SA
 }
 
-// ikeRekeyPayloads extracts the narrowed IKE proposal, the nonce, and the KE
-// payload (returned whole so callers can read its DH group) from a CREATE_CHILD_SA
-// IKE-rekey request or response.
-func ikeRekeyPayloads(inner ikemsg.Payloads) (prop ikemsg.Proposal, nonce []byte, ke *ikemsg.KEPayload, err error) {
-	var sa *ikemsg.SAPayload
+// ikeRekeyPayloads extracts the SA payload, the nonce, and the KE payload
+// (returned whole so callers can read its DH group) from a CREATE_CHILD_SA
+// IKE-rekey request or response. Proposal/suite selection is left to the
+// caller: a response we receive demands a strict narrowed selection
+// (selectedIKESuite), a peer request a preference-ordered pick constrained by
+// the KE group (selectIKEProposal) — mirrors childRekeyRequestPayloads.
+func ikeRekeyPayloads(inner ikemsg.Payloads) (saP *ikemsg.SAPayload, nonce []byte, ke *ikemsg.KEPayload, err error) {
 	for _, p := range inner {
 		switch v := p.(type) {
 		case *ikemsg.SAPayload:
-			sa = v
+			saP = v
 		case *ikemsg.NoncePayload:
 			nonce = append([]byte(nil), v.Data...)
 		case *ikemsg.KEPayload:
 			ke = v
 		case *ikemsg.NotifyPayload:
 			if e := notifyError(v); e != nil {
-				return ikemsg.Proposal{}, nil, nil, e
+				return nil, nil, nil, e
 			}
 		}
 	}
-	if sa == nil {
-		return ikemsg.Proposal{}, nil, nil, errors.New("session: IKE rekey missing SA payload")
-	}
-	prop, ok := selectIKEProposal(sa)
-	if !ok {
-		return ikemsg.Proposal{}, nil, nil, fmt.Errorf("session: no offered IKE proposal matches our suite (%s)", describeProposals(sa))
+	if saP == nil {
+		return nil, nil, nil, errors.New("session: IKE rekey missing SA payload")
 	}
 	if len(nonce) == 0 || ke == nil || len(ke.Data) == 0 {
-		return ikemsg.Proposal{}, nil, nil, errors.New("session: IKE rekey missing Nonce/KE")
+		return nil, nil, nil, errors.New("session: IKE rekey missing Nonce/KE")
 	}
-	return prop, nonce, ke, nil
+	return saP, nonce, ke, nil
 }
 
 // isIKERekey reports whether a CREATE_CHILD_SA payload set rekeys the IKE SA (an

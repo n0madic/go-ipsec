@@ -7,6 +7,7 @@ import (
 
 	"github.com/n0madic/go-ipsec/internal/esp"
 	"github.com/n0madic/go-ipsec/internal/ikemsg"
+	"github.com/n0madic/go-ipsec/internal/ikesa"
 )
 
 // keyLenAES256 is the AES-256 Key Length attribute value (in bits) carried on
@@ -92,17 +93,6 @@ func proposalHasDHGroup(p ikemsg.Proposal, g uint16) bool {
 	return hasTransform(p.ByType(ikemsg.TransformDH), g, nil)
 }
 
-// negotiateDHGroup returns this client's most-preferred DH group that the offered
-// proposal advertises, and whether any supported group was found.
-func negotiateDHGroup(p ikemsg.Proposal) (uint16, bool) {
-	for _, g := range preferredDHGroups {
-		if proposalHasDHGroup(p, g) {
-			return g, true
-		}
-	}
-	return 0, false
-}
-
 // selectedDHGroup returns the single DH-group ID carried by a narrowed responder
 // proposal (the responder selects exactly one transform per type, RFC 7296 §2.7),
 // or 0 when the proposal carries no DH transform.
@@ -114,19 +104,87 @@ func selectedDHGroup(p ikemsg.Proposal) uint16 {
 	return dh[0].ID
 }
 
-// buildIKEProposal returns the protocol-IKE SA proposal for IKE_SA_INIT,
-// advertising one DH-group transform per group in the order given (so an
-// IKE_SA_INIT offer can list both x25519 and MODP-2048). Transforms are emitted in
-// the canonical order Encr, PRF, Integ, DH (RFC 7296 §3.3).
-func buildIKEProposal(number uint8, groups ...uint16) ikemsg.Proposal {
+// ikeSuite describes one negotiable IKE SA (SK{} envelope) transform suite:
+// the wire transforms it is offered and matched by, and the SK_e*/SK_a*
+// lengths internal/ikesa derives for it (the suite fixes the SKEYSEED split —
+// RFC 5282 §7). The PRF is PRF_HMAC_SHA2_256 in every row: it also drives the
+// AUTH signed octets, so only the encryption transform is negotiable.
+type ikeSuite struct {
+	id     ikesa.Suite
+	encrID uint16 // ENCR transform ID
+	// keyBits is the Key Length attribute value on the ENCR transform; 0 means
+	// the attribute is ABSENT (ChaCha20-Poly1305, RFC 7634 §2). Matching is
+	// strict in both directions, like the ESP table.
+	keyBits    uint16
+	encrKeyLen int // SK_e* length (including the 4-byte salt for AEAD)
+	// integID is the INTEG transform ID; 0 means the suite is AEAD and no INTEG
+	// transform is emitted (this client never offers an explicit AUTH_NONE).
+	integID     uint16
+	integKeyLen int // SK_a* length (0 for AEAD)
+}
+
+// name returns the suite's diagnostic name (shared with ikesa.Suite.String).
+func (s ikeSuite) name() string { return s.id.String() }
+
+// aead reports whether the suite is a combined-mode (AEAD) cipher.
+func (s ikeSuite) aead() bool { return s.integID == 0 }
+
+// ikeSuites is the negotiable IKE suite table in this client's preference
+// order, mirroring the ESP table: AES-256-GCM-16 (RFC 5282, single pass,
+// hardware-accelerated), ChaCha20-Poly1305 (RFC 7634), then the RFC-MUST
+// AES-CBC-256 + HMAC-SHA2-256-128.
+var ikeSuites = []ikeSuite{
+	{id: ikesa.SuiteAESGCM256, encrID: ikemsg.ENCR_AES_GCM_16, keyBits: keyLenAES256, encrKeyLen: 36},
+	{id: ikesa.SuiteChaCha20Poly1305, encrID: ikemsg.ENCR_CHACHA20_POLY1305, encrKeyLen: 36},
+	{id: ikesa.SuiteAESCBC256SHA256, encrID: ikemsg.ENCR_AES_CBC, keyBits: keyLenAES256, encrKeyLen: 32,
+		integID: ikemsg.AUTH_HMAC_SHA2_256_128, integKeyLen: 32},
+}
+
+// ikeSuiteByID returns the table row for an ikesa.Suite id.
+func ikeSuiteByID(id ikesa.Suite) (ikeSuite, bool) {
+	for _, s := range ikeSuites {
+		if s.id == id {
+			return s, true
+		}
+	}
+	return ikeSuite{}, false
+}
+
+// enabledIKESuites maps Config.IKESuites into suite-table rows, preserving the
+// caller's preference order; nil/empty enables the full table in its built-in
+// order. Unknown ids are skipped (the public config layer validates them).
+func (s *Session) enabledIKESuites() []ikeSuite {
+	if len(s.cfg.IKESuites) == 0 {
+		return ikeSuites
+	}
+	out := make([]ikeSuite, 0, len(s.cfg.IKESuites))
+	for _, id := range s.cfg.IKESuites {
+		if is, ok := ikeSuiteByID(id); ok {
+			out = append(out, is)
+		}
+	}
+	return out
+}
+
+// buildIKEProposalForSuite returns the protocol-IKE proposal for one suite,
+// with transforms in the canonical order Encr, PRF, [Integ], DH (RFC 7296
+// §3.3; an IKE proposal carries no ESN). spi is empty for IKE_SA_INIT and the
+// 8-byte IKE SPI for CREATE_CHILD_SA rekeys. An AEAD suite emits no INTEG
+// transform (RFC 7296 §3.3.3) and a keyBits==0 suite no Key Length attribute.
+func buildIKEProposalForSuite(number uint8, s ikeSuite, spi []byte, groups ...uint16) ikemsg.Proposal {
 	p := ikemsg.Proposal{
 		Number:   number,
 		Protocol: ikemsg.ProtocolIKE,
 		Transforms: []ikemsg.Transform{
-			{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_AES_CBC, KeyLength: keyLenAES256, HasKeyLength: true},
+			{Type: ikemsg.TransformEncr, ID: s.encrID, KeyLength: s.keyBits, HasKeyLength: s.keyBits != 0},
 			{Type: ikemsg.TransformPRF, ID: ikemsg.PRF_HMAC_SHA2_256},
-			{Type: ikemsg.TransformInteg, ID: ikemsg.AUTH_HMAC_SHA2_256_128},
 		},
+	}
+	if len(spi) > 0 {
+		p.SPI = append([]byte(nil), spi...)
+	}
+	if !s.aead() {
+		p.Transforms = append(p.Transforms, ikemsg.Transform{Type: ikemsg.TransformInteg, ID: s.integID})
 	}
 	for _, g := range groups {
 		p.Transforms = append(p.Transforms, ikemsg.Transform{Type: ikemsg.TransformDH, ID: g})
@@ -134,13 +192,28 @@ func buildIKEProposal(number uint8, groups ...uint16) ikemsg.Proposal {
 	return p
 }
 
-// buildIKEProposalSPI returns the protocol-IKE SA proposal carrying an 8-byte
-// SPI, used in CREATE_CHILD_SA when rekeying the IKE SA. The DH groups offered are
-// the established group (an IKE rekey reuses the negotiated group).
-func buildIKEProposalSPI(number uint8, spi []byte, groups ...uint16) ikemsg.Proposal {
-	p := buildIKEProposal(number, groups...)
-	p.SPI = append([]byte(nil), spi...)
-	return p
+// buildIKEProposals returns one IKE proposal per enabled suite for IKE_SA_INIT,
+// numbered 1..n in the given preference order — the same one-proposal-per-suite
+// discipline as buildESPProposals (our preference governs the responder's pick,
+// selections map back to suites trivially, AEAD and non-AEAD transforms never
+// mix in one proposal). Any DH groups are advertised identically on every
+// proposal.
+func buildIKEProposals(suites []ikeSuite, groups ...uint16) []ikemsg.Proposal {
+	props := make([]ikemsg.Proposal, 0, len(suites))
+	for i, s := range suites {
+		props = append(props, buildIKEProposalForSuite(uint8(i+1), s, nil, groups...))
+	}
+	return props
+}
+
+// buildIKEProposalsSPI is the CREATE_CHILD_SA (IKE SA rekey) variant of
+// buildIKEProposals, carrying the new 8-byte IKE SPI on every proposal.
+func buildIKEProposalsSPI(spi []byte, suites []ikeSuite, groups ...uint16) []ikemsg.Proposal {
+	props := make([]ikemsg.Proposal, 0, len(suites))
+	for i, s := range suites {
+		props = append(props, buildIKEProposalForSuite(uint8(i+1), s, spi, groups...))
+	}
+	return props
 }
 
 // buildESPProposalForSuite returns the protocol-ESP Child SA proposal for one
@@ -208,20 +281,63 @@ func hasTransform(ts []ikemsg.Transform, id uint16, keyLen *uint16) bool {
 	return false
 }
 
-// matchesIKESuite reports whether an IKE proposal offers the suite internal/ikesa
-// can run (AES-CBC-256 + PRF-HMAC-SHA2-256 + AUTH-HMAC-SHA2-256-128 + a DH group
-// we support: x25519 or MODP-2048), tolerating extra alternative transforms a
-// peer-initiated proposal may list alongside ours.
-func matchesIKESuite(p ikemsg.Proposal) bool {
+// ikeSuiteMatchesProposal reports whether an IKE proposal offers the given
+// suite, tolerating extra alternative transforms a peer-initiated proposal may
+// list alongside ours (presence semantics, like suiteMatchesProposal). The
+// ENCR key length is matched strictly in both directions, the PRF must be
+// present, and for an AEAD suite the proposal must carry either no INTEG
+// transform or an explicit AUTH_NONE among the alternatives (RFC 7296 §3.3.3).
+// The DH group is checked separately by the callers — the constraint differs
+// per exchange (IKE_SA_INIT narrows via selectedDHGroup, a rekey via the KE
+// group).
+func ikeSuiteMatchesProposal(s ikeSuite, p ikemsg.Proposal) bool {
 	if p.Protocol != ikemsg.ProtocolIKE {
 		return false
 	}
-	keyLen := keyLenAES256
-	_, dhOK := negotiateDHGroup(p)
-	return hasTransform(p.ByType(ikemsg.TransformEncr), ikemsg.ENCR_AES_CBC, &keyLen) &&
-		hasTransform(p.ByType(ikemsg.TransformPRF), ikemsg.PRF_HMAC_SHA2_256, nil) &&
-		hasTransform(p.ByType(ikemsg.TransformInteg), ikemsg.AUTH_HMAC_SHA2_256_128, nil) &&
-		dhOK
+	keyBits := s.keyBits
+	if !hasTransform(p.ByType(ikemsg.TransformEncr), s.encrID, &keyBits) {
+		return false
+	}
+	if !hasTransform(p.ByType(ikemsg.TransformPRF), ikemsg.PRF_HMAC_SHA2_256, nil) {
+		return false
+	}
+	integs := p.ByType(ikemsg.TransformInteg)
+	if s.aead() {
+		return len(integs) == 0 || hasTransform(integs, ikemsg.AUTH_NONE, nil)
+	}
+	return hasTransform(integs, s.integID, nil)
+}
+
+// isIKESelectionFor reports whether p is a valid narrowed responder SELECTION
+// of the given IKE suite: exactly one ENCR transform, exactly one PRF, and an
+// unambiguous integrity type (none or a single AUTH_NONE for AEAD, exactly one
+// HMAC otherwise). The selected suite fixes the SKEYSEED split — SK_a* absent
+// and SK_e* salted for AEAD — so an ambiguous "selection" would leave the key
+// schedule undefined (mirrors isESPSelectionFor).
+func isIKESelectionFor(s ikeSuite, p ikemsg.Proposal) bool {
+	if !ikeSuiteMatchesProposal(s, p) ||
+		len(p.ByType(ikemsg.TransformEncr)) != 1 || len(p.ByType(ikemsg.TransformPRF)) != 1 {
+		return false
+	}
+	integs := p.ByType(ikemsg.TransformInteg)
+	if s.aead() {
+		return len(integs) == 0 || (len(integs) == 1 && integs[0].ID == ikemsg.AUTH_NONE)
+	}
+	return len(integs) == 1
+}
+
+// selectedIKESuite maps a narrowed responder IKE proposal to the single
+// enabled suite it selects, or ok=false when the proposal is ambiguous or
+// selects a suite we did not offer. At most one suite can pass
+// isIKESelectionFor (the single ENCR transform pins the suite), so the enabled
+// order does not matter here — it is the responder's choice being decoded.
+func selectedIKESuite(p ikemsg.Proposal, enabled []ikeSuite) (ikeSuite, bool) {
+	for _, s := range enabled {
+		if isIKESelectionFor(s, p) {
+			return s, true
+		}
+	}
+	return ikeSuite{}, false
 }
 
 // suiteMatchesProposal reports whether an ESP proposal offers the given suite,
@@ -308,15 +424,26 @@ func selectESPProposal(sa *ikemsg.SAPayload, enabled []espSuite, requireGroup ui
 	return ikemsg.Proposal{}, espSuite{}, false
 }
 
-// selectIKEProposal returns the first offered IKE proposal that matches our
-// suite and carries an 8-byte SPI (CREATE_CHILD_SA IKE rekey), or ok=false.
-func selectIKEProposal(sa *ikemsg.SAPayload) (ikemsg.Proposal, bool) {
-	for _, p := range sa.Proposals {
-		if matchesIKESuite(p) && len(p.SPI) == 8 {
-			return p, true
+// selectIKEProposal picks from a peer-initiated IKE-rekey offer: it returns
+// the first enabled suite (in OUR preference order) that some offered IKE
+// proposal advertises with an 8-byte SPI, together with that proposal.
+// requireGroup, when non-zero, additionally requires the proposal to advertise
+// that DH group — the peer's KE group may be advertised by only some of its
+// proposals, and the DH exchange must run against a proposal that actually
+// offered the group (RFC 7296 §3.3; mirrors selectESPProposal).
+func selectIKEProposal(sa *ikemsg.SAPayload, enabled []ikeSuite, requireGroup uint16) (ikemsg.Proposal, ikeSuite, bool) {
+	for _, s := range enabled {
+		for _, p := range sa.Proposals {
+			if !ikeSuiteMatchesProposal(s, p) || len(p.SPI) != 8 {
+				continue
+			}
+			if requireGroup != 0 && !proposalHasDHGroup(p, requireGroup) {
+				continue
+			}
+			return p, s, true
 		}
 	}
-	return ikemsg.Proposal{}, false
+	return ikemsg.Proposal{}, ikeSuite{}, false
 }
 
 // describeProposals renders the offered proposals' transform IDs so a no-match

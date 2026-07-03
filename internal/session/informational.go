@@ -52,7 +52,7 @@ func encodeSKEmptyWith(c *ikeCtx, exchangeType ikemsg.ExchangeType, flags ikemsg
 	if err != nil {
 		return nil, err
 	}
-	if err := c.sa.Checksum(raw); err != nil {
+	if err := c.sa.FinalizeSK(raw, len(skData)); err != nil {
 		return nil, err
 	}
 	return raw, nil

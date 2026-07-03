@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/n0madic/go-ipsec/internal/esp"
+	"github.com/n0madic/go-ipsec/internal/ikesa"
 )
 
 // Default lifecycle parameters.
@@ -45,12 +46,13 @@ const (
 // Only stdlib-shaped fields are exposed; everything provider-specific lives in the
 // caller.
 //
-// The IKE SA cipher suite is fixed: AES-CBC-256 encryption, PRF-HMAC-SHA2-256,
-// AUTH-HMAC-SHA2-256-128 integrity, and a DH group of x25519 (group 31,
-// preferred) or MODP-2048 (group 14, fallback) negotiated at IKE_SA_INIT. The
-// ESP (Child SA) suite IS negotiated, from the suites in ESPCipherSuites
-// (default preference: AES-256-GCM-16, ChaCha20-Poly1305, then AES-CBC-256 +
-// HMAC-SHA2-256-128).
+// Both the IKE SA encryption (the SK{} envelope, AEAD per RFC 5282) and the
+// ESP (Child SA) suite are negotiated from the same suite set — default
+// preference AES-256-GCM-16, ChaCha20-Poly1305, then AES-CBC-256 +
+// HMAC-SHA2-256-128 — restrictable via IKECipherSuites / ESPCipherSuites
+// independently. The IKE PRF is fixed to HMAC-SHA2-256 and the DH group to
+// x25519 (group 31, preferred) or MODP-2048 (group 14, fallback), negotiated
+// at IKE_SA_INIT.
 type Config struct {
 	// Server is the responder endpoint, host:port. Port defaults to 500.
 	Server string
@@ -110,6 +112,16 @@ type Config struct {
 	// duplicate values fail validation. The IKE SA suite is not affected.
 	ESPCipherSuites []CipherSuite
 
+	// IKECipherSuites restricts and orders the encryption suites offered for
+	// the IKE SA itself (the SK{} envelope, RFC 5282 for the AEAD suites) at
+	// IKE_SA_INIT and on IKE SA rekeys, most-preferred first. It takes the same
+	// CipherSuite values as ESPCipherSuites; nil or empty offers every
+	// implemented suite in the default preference order (AES-256-GCM-16,
+	// ChaCha20-Poly1305, AES-CBC-256+HMAC-SHA2-256-128). The IKE PRF
+	// (HMAC-SHA2-256) and DH groups are fixed — only the encryption transform
+	// is negotiated. Unknown or duplicate values fail validation.
+	IKECipherSuites []CipherSuite
+
 	// ChildSAPFS offers per-Child Perfect Forward Secrecy (a fresh MODP-2048 /
 	// group 14 Diffie-Hellman exchange) on Child SA rekeys this client initiates.
 	// A server-initiated PFS rekey is always honored regardless of this setting,
@@ -145,7 +157,8 @@ type Config struct {
 	ReconnectAttemptTimeout time.Duration
 }
 
-// CipherSuite selects an ESP transform suite for Config.ESPCipherSuites.
+// CipherSuite selects a transform suite for Config.ESPCipherSuites and
+// Config.IKECipherSuites (the same suites are implemented for both layers).
 type CipherSuite uint8
 
 const (
@@ -173,6 +186,21 @@ func (cs CipherSuite) espSuite() (esp.Suite, bool) {
 		return esp.SuiteChaCha20Poly1305, true
 	case CipherSuiteAESCBC256SHA256:
 		return esp.SuiteAESCBC256SHA256, true
+	default:
+		return 0, false
+	}
+}
+
+// ikeSuite maps the public constant to the internal IKE SA suite id; ok is
+// false for values outside the defined set.
+func (cs CipherSuite) ikeSuite() (ikesa.Suite, bool) {
+	switch cs {
+	case CipherSuiteAESGCM256:
+		return ikesa.SuiteAESGCM256, true
+	case CipherSuiteChaCha20Poly1305:
+		return ikesa.SuiteChaCha20Poly1305, true
+	case CipherSuiteAESCBC256SHA256:
+		return ikesa.SuiteAESCBC256SHA256, true
 	default:
 		return 0, false
 	}
@@ -242,18 +270,14 @@ func (c *Config) validate() error {
 	if err := c.RemoteID.check(); err != nil {
 		return fmt.Errorf("ipsec: Config.RemoteID: %w", err)
 	}
-	// ESP suites: unknown values would be silently unofferable and a duplicate
-	// signals a caller-side mixup, so both fail loudly here rather than at the
-	// handshake.
-	seenSuites := make(map[CipherSuite]bool, len(c.ESPCipherSuites))
-	for _, cs := range c.ESPCipherSuites {
-		if _, ok := cs.espSuite(); !ok {
-			return fmt.Errorf("ipsec: Config.ESPCipherSuites: unknown cipher suite %d", uint8(cs))
-		}
-		if seenSuites[cs] {
-			return fmt.Errorf("ipsec: Config.ESPCipherSuites: duplicate cipher suite %v", cs)
-		}
-		seenSuites[cs] = true
+	// Cipher-suite lists: unknown values would be silently unofferable and a
+	// duplicate signals a caller-side mixup, so both fail loudly here rather
+	// than at the handshake.
+	if err := validateCipherSuites("ESPCipherSuites", c.ESPCipherSuites); err != nil {
+		return err
+	}
+	if err := validateCipherSuites("IKECipherSuites", c.IKECipherSuites); err != nil {
+		return err
 	}
 	if c.MTU == 0 {
 		c.MTU = DefaultMTU
@@ -308,6 +332,23 @@ func (c *Config) validate() error {
 		c.Logger.Warn("ipsec: MTU below floor, raising it",
 			"configured", c.MTU, "floor", MinMTU)
 		c.MTU = MinMTU
+	}
+	return nil
+}
+
+// validateCipherSuites rejects unknown and duplicate values in a Config
+// cipher-suite list; field names the offending Config field in the error. The
+// ESP and IKE layers implement the same suite set, so one check serves both.
+func validateCipherSuites(field string, suites []CipherSuite) error {
+	seen := make(map[CipherSuite]bool, len(suites))
+	for _, cs := range suites {
+		if _, ok := cs.espSuite(); !ok {
+			return fmt.Errorf("ipsec: Config.%s: unknown cipher suite %d", field, uint8(cs))
+		}
+		if seen[cs] {
+			return fmt.Errorf("ipsec: Config.%s: duplicate cipher suite %v", field, cs)
+		}
+		seen[cs] = true
 	}
 	return nil
 }

@@ -36,11 +36,11 @@ and to route them into proxy-service rotation via a SOCKS5 sidecar
 ## Status
 
 **Working** for IKEv2 with **EAP-MSCHAPv2** or **pre-shared key (PSK)**
-authentication. The IKE SA runs a fixed transform suite (AES-CBC-256 /
-PRF-HMAC-SHA2-256 / AUTH-HMAC-SHA2-256-128 / DH x25519 group 31, preferred, or
-MODP-2048 group 14, fallback); the ESP suite is negotiated (AES-256-GCM-16,
-ChaCha20-Poly1305, or AES-CBC-256 + HMAC-SHA2-256-128). Implemented and
-exercised end-to-end:
+authentication. Both the IKE SA encryption (SK{} envelope, AEAD per RFC 5282)
+and the ESP suite are negotiated from AES-256-GCM-16, ChaCha20-Poly1305, or
+AES-CBC-256 + HMAC-SHA2-256-128; the IKE PRF is fixed to HMAC-SHA2-256 and the
+DH group to x25519 (group 31, preferred) or MODP-2048 (group 14, fallback).
+Implemented and exercised end-to-end:
 
 - **IKE_SA_INIT** + **IKE_AUTH** with either EAP-MSCHAPv2 (certificate-chain +
   AUTH payload verification) or a pre-shared key (single-round mutual AUTH, no
@@ -228,28 +228,26 @@ pointer to `false` disables it.
 
 ## Cipher suite
 
-The **IKE SA** suite is fixed and not configurable, negotiated at IKE_SA_INIT:
+Both the **IKE SA** encryption (the SK{} envelope, AEAD per RFC 5282) and the
+**ESP (Child SA)** suite are negotiated via the SA payload — one proposal per
+suite, in preference order. The same suite set serves both layers:
 
-| Role | Algorithm |
-|---|---|
-| Encryption | AES-CBC-256 |
-| PRF | HMAC-SHA2-256 |
-| Integrity | AUTH-HMAC-SHA2-256-128 |
-| DH group | x25519 (group 31, preferred) or MODP-2048 (group 14, fallback) |
-
-The **ESP (Child SA)** suite is negotiated via the SA payload — one proposal per
-suite, in preference order:
-
-| `Config.ESPCipherSuites` value | ESP transform | Type |
+| `CipherSuite` value | Transform | Type |
 |---|---|---|
-| `CipherSuiteAESGCM256` (default #1) | ENCR_AES_GCM_16, 256-bit (RFC 4106) | AEAD |
+| `CipherSuiteAESGCM256` (default #1) | ENCR_AES_GCM_16, 256-bit (RFC 4106 / RFC 5282) | AEAD |
 | `CipherSuiteChaCha20Poly1305` (default #2) | ENCR_CHACHA20_POLY1305 (RFC 7634) | AEAD |
 | `CipherSuiteAESCBC256SHA256` (default #3) | AES-CBC-256 + AUTH-HMAC-SHA2-256-128 | classic |
 
-`Config.ESPCipherSuites` (nil = all, in the order above) restricts and reorders
-the offer — e.g. pin `[]ipsec.CipherSuite{ipsec.CipherSuiteAESCBC256SHA256}` for
-an AES-CBC-only gateway policy. Per-Child PFS, when offered, uses a fresh
-MODP-2048 (group 14) exchange.
+`Config.IKECipherSuites` and `Config.ESPCipherSuites` (nil = all, in the order
+above) independently restrict and reorder the two offers — e.g. pin
+`[]ipsec.CipherSuite{ipsec.CipherSuiteAESCBC256SHA256}` for an AES-CBC-only
+gateway policy.
+
+The rest of the IKE SA suite is fixed: PRF HMAC-SHA2-256 (also with AEAD
+encryption — it drives the key schedule and AUTH octets) and a DH group of
+x25519 (group 31, preferred) or MODP-2048 (group 14, fallback), negotiated at
+IKE_SA_INIT. Per-Child PFS, when offered, uses a fresh MODP-2048 (group 14)
+exchange.
 
 ## Identities
 
@@ -425,9 +423,9 @@ until the process exits.
   only; no `BIND` either).
 - **NAT-T is mandatory** — a userspace client cannot send raw ESP, so traffic is
   always UDP-encapsulated on port 4500.
-- The **IKE SA cipher suite is fixed** (see [Cipher suite](#cipher-suite)); only
-  the ESP suite is negotiable via `Config.ESPCipherSuites`. AEAD for the IKE
-  envelope itself (RFC 5282) is not implemented.
+- Only the **encryption transform** of the IKE SA is negotiable (AEAD for the
+  SK{} envelope per RFC 5282, via `Config.IKECipherSuites`); the IKE PRF and
+  the DH groups are fixed (see [Cipher suite](#cipher-suite)).
 - **Initiator only** — go-ipsec dials out; it is not an IKEv2 responder.
 - **No certificate revocation checking** — the server chain is verified for
   trust, expiry, EKU, and SAN/identity match, but OCSP and CRLs are not

@@ -29,7 +29,7 @@ func TestDeriveRejectsShortNonces(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &IKESA{}
-			err := s.Derive(Initiator, 1, 2, tc.ni, tc.nr, dh)
+			err := s.Derive(SuiteAESCBC256SHA256, Initiator, 1, 2, tc.ni, tc.nr, dh)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Derive err = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -37,10 +37,10 @@ func TestDeriveRejectsShortNonces(t *testing.T) {
 				return
 			}
 			// The rekey path enforces the same floor.
-			if _, err := DeriveRekeyIKE(s.SKd, Initiator, 3, 4, tc.ni, tc.nr, dh); err != nil {
+			if _, err := DeriveRekeyIKE(SuiteAESCBC256SHA256, s.SKd, Initiator, 3, 4, tc.ni, tc.nr, dh); err != nil {
 				t.Fatalf("DeriveRekeyIKE: %v", err)
 			}
-			if _, err := DeriveRekeyIKE(s.SKd, Initiator, 3, 4, short, tc.nr, dh); err == nil {
+			if _, err := DeriveRekeyIKE(SuiteAESCBC256SHA256, s.SKd, Initiator, 3, 4, short, tc.nr, dh); err == nil {
 				t.Fatal("DeriveRekeyIKE accepted a short nonce")
 			}
 		})

@@ -14,8 +14,17 @@ import (
 )
 
 // mirrorSessions builds an initiator and responder session sharing derived IKE
-// SA keys over a memory transport pair.
+// SA keys over a memory transport pair. The envelope runs the default AES-GCM
+// suite, so the whole post-handshake test suite (DPD, ack, dedup, grace,
+// rekey) exercises the RFC 5282 AEAD SK{} framing; mirrorSessionsSuite selects
+// another suite explicitly.
 func mirrorSessions(t *testing.T) (initS, respS *Session, respConn transport.Conn) {
+	t.Helper()
+	return mirrorSessionsSuite(t, ikesa.SuiteAESGCM256)
+}
+
+// mirrorSessionsSuite is mirrorSessions with an explicit IKE envelope suite.
+func mirrorSessionsSuite(t *testing.T, suite ikesa.Suite) (initS, respS *Session, respConn transport.Conn) {
 	t.Helper()
 	ni := bytes.Repeat([]byte{0x11}, 32)
 	nr := bytes.Repeat([]byte{0x22}, 32)
@@ -23,11 +32,11 @@ func mirrorSessions(t *testing.T) (initS, respS *Session, respConn transport.Con
 	const spii, spir = 0xAAAA, 0xBBBB
 
 	initSA := &ikesa.IKESA{}
-	if err := initSA.Derive(ikesa.Initiator, spii, spir, ni, nr, shared); err != nil {
+	if err := initSA.Derive(suite, ikesa.Initiator, spii, spir, ni, nr, shared); err != nil {
 		t.Fatal(err)
 	}
 	respSA := &ikesa.IKESA{}
-	if err := respSA.Derive(ikesa.Responder, spii, spir, ni, nr, shared); err != nil {
+	if err := respSA.Derive(suite, ikesa.Responder, spii, spir, ni, nr, shared); err != nil {
 		t.Fatal(err)
 	}
 

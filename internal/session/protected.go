@@ -51,7 +51,7 @@ func encodeSKWith(ike *ikesa.IKESA, spii, spir uint64, exchangeType ikemsg.Excha
 	if err != nil {
 		return nil, fmt.Errorf("session: encode SK message: %w", err)
 	}
-	if err := ike.Checksum(raw); err != nil {
+	if err := ike.FinalizeSK(raw, len(skData)); err != nil {
 		return nil, err
 	}
 	return raw, nil
@@ -81,17 +81,16 @@ func (s *Session) decodeIKE(raw []byte) (*ikemsg.Message, ikemsg.Payloads, *ikeC
 	return m, inner, cur, err
 }
 
-// decodeSKWith verifies+decrypts under one IKE SA. icvOK reports whether the ICV
-// matched (false → caller may retry under a different SA). ikemsg.Parse is fully
-// bounds-checked, so a malformed or spoofed datagram returns an error here rather
-// than panicking the process.
+// decodeSKWith verifies+decrypts under one IKE SA. icvOK reports whether the
+// integrity check passed (false → caller may retry under a different SA; a
+// message with no SK payload also reports false, since retrying it under the
+// old SA is harmless and yields the same error). ikemsg.Parse is fully
+// bounds-checked, so a malformed or spoofed datagram returns an error here
+// rather than panicking the process.
 func decodeSKWith(ike *ikesa.IKESA, raw []byte) (*ikemsg.Message, ikemsg.Payloads, bool, error) {
 	m, err := ikemsg.Parse(raw)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("session: decode SK message: %w", err)
-	}
-	if !ike.VerifyChecksum(raw) {
-		return m, nil, false, errors.New("session: SK message ICV verification failed")
 	}
 	var enc *ikemsg.EncryptedPayload
 	for _, p := range m.Payloads {
@@ -101,11 +100,11 @@ func decodeSKWith(ike *ikesa.IKESA, raw []byte) (*ikemsg.Message, ikemsg.Payload
 		}
 	}
 	if enc == nil {
-		return m, nil, true, errors.New("session: message has no SK payload")
+		return m, nil, false, errors.New("session: message has no SK payload")
 	}
-	plaintext, err := ike.DecryptSK(enc.Data)
+	plaintext, icvOK, err := ike.OpenSK(raw, enc.Data)
 	if err != nil {
-		return nil, nil, true, err
+		return m, nil, icvOK, err
 	}
 	inner, err := ikemsg.ParsePayloads(enc.InnerFirst, plaintext)
 	if err != nil {

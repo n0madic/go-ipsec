@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/n0madic/go-ipsec/internal/esp"
+	"github.com/n0madic/go-ipsec/internal/ikesa"
 )
 
 func TestConfigValidateRequiresCredentials(t *testing.T) {
@@ -367,6 +368,56 @@ func TestConfigValidateESPCipherSuites(t *testing.T) {
 	dup.ESPCipherSuites = []CipherSuite{CipherSuiteAESGCM256, CipherSuiteAESGCM256}
 	if err := dup.validate(); err == nil {
 		t.Fatal("duplicate cipher suite accepted")
+	}
+}
+
+// TestConfigValidateIKECipherSuites: the IKE suite list gets the same
+// validation as the ESP one (unknown and duplicate values fail; nil and every
+// defined value pass), the error names the right Config field, and the mapping
+// into internal IKE suite ids preserves the caller's preference order.
+func TestConfigValidateIKECipherSuites(t *testing.T) {
+	base := func() Config {
+		return Config{Server: "vpn:500", EAP: EAPMSCHAPv2{Username: "u", Password: "p"}}
+	}
+
+	nilSuites := base()
+	if err := nilSuites.validate(); err != nil {
+		t.Fatalf("nil IKECipherSuites rejected: %v", err)
+	}
+	if got := ikeSuitesFromConfig(nilSuites.IKECipherSuites); got != nil {
+		t.Fatalf("nil IKECipherSuites mapped to %v, want nil (full built-in table)", got)
+	}
+
+	all := base()
+	all.IKECipherSuites = []CipherSuite{CipherSuiteAESCBC256SHA256, CipherSuiteAESGCM256, CipherSuiteChaCha20Poly1305}
+	if err := all.validate(); err != nil {
+		t.Fatalf("full IKE suite list rejected: %v", err)
+	}
+	want := []ikesa.Suite{ikesa.SuiteAESCBC256SHA256, ikesa.SuiteAESGCM256, ikesa.SuiteChaCha20Poly1305}
+	got := ikeSuitesFromConfig(all.IKECipherSuites)
+	if len(got) != len(want) {
+		t.Fatalf("mapped %d suites, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("suite %d mapped to %v, want %v (preference order lost)", i, got[i], want[i])
+		}
+	}
+
+	unknown := base()
+	unknown.IKECipherSuites = []CipherSuite{CipherSuite(99)}
+	err := unknown.validate()
+	if err == nil {
+		t.Fatal("unknown IKE cipher suite accepted")
+	}
+	if !strings.Contains(err.Error(), "IKECipherSuites") {
+		t.Fatalf("error does not name the IKECipherSuites field: %v", err)
+	}
+
+	dup := base()
+	dup.IKECipherSuites = []CipherSuite{CipherSuiteAESGCM256, CipherSuiteAESGCM256}
+	if err := dup.validate(); err == nil {
+		t.Fatal("duplicate IKE cipher suite accepted")
 	}
 }
 

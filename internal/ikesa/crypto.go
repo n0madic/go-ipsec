@@ -7,23 +7,59 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// Fixed sizes for the v1 transform suite. They double as the SK_* key lengths
-// fed into prf+ during key derivation.
+// Fixed sizes for the negotiable transform suites. They double as the SK_*
+// key lengths fed into prf+ during key derivation.
 const (
 	// prfKeyLen is the PRF_HMAC_SHA2_256 key/output length → SK_d, SK_p*.
 	prfKeyLen = 32
-	// integKeyLen is the AUTH_HMAC_SHA2_256_128 key length → SK_a*.
+	// integKeyLen is the AUTH_HMAC_SHA2_256_128 key length → SK_a* (CBC suite).
 	integKeyLen = 32
 	// integICVLen is the AUTH_HMAC_SHA2_256_128 truncated output (128 bits).
 	integICVLen = 16
-	// encrKeyLen is the ENCR_AES_CBC-256 key length → SK_e*.
+	// encrKeyLen is the ENCR_AES_CBC-256 key length → SK_e* (CBC suite).
 	encrKeyLen = 32
 	// aesBlock is the AES/CBC block and IV size.
 	aesBlock = aes.BlockSize
+
+	// AEAD SK{} framing (RFC 5282): an 8-byte per-message IV on the wire, a
+	// 12-byte nonce built as salt(4) | IV(8), and a 16-octet ICV (tag).
+	aeadIVLen   = 8
+	aeadSaltLen = 4
+	aeadTagLen  = 16
+	// aeadEncrKeyLen is the AEAD SK_e* length: a 32-byte key with the 4-byte
+	// salt taken from the END of the keying material (RFC 5282 §7.1/§7.4,
+	// RFC 7634 §3). The AEAD suites have no SK_a* (RFC 5282 §7).
+	aeadEncrKeyLen = 32 + aeadSaltLen
+
+	// ikeHdrLen/genericHdrLen bound the minimum SK-body offset inside a
+	// message: the fixed IKE header plus the SK payload's generic header.
+	ikeHdrLen     = 28
+	genericHdrLen = 4
 )
+
+// newAEAD constructs the AEAD primitive for an AEAD suite from a 32-byte key
+// (a deliberate mirror of internal/esp's helper — the packages stay
+// independent so ikesa never imports the data plane).
+func newAEAD(suite Suite, key []byte) (cipher.AEAD, error) {
+	switch suite {
+	case SuiteAESGCM256:
+		b, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		return cipher.NewGCM(b)
+	case SuiteChaCha20Poly1305:
+		return chacha20poly1305.New(key)
+	default:
+		return nil, fmt.Errorf("ikesa: suite %v is not an AEAD suite", suite)
+	}
+}
 
 // prf is the negotiated pseudorandom function, PRF_HMAC_SHA2_256. It returns
 // the keyed MAC of data — RFC 7296's prf(key, data).

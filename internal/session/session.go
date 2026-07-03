@@ -62,6 +62,12 @@ type Config struct {
 	// ipsec.Config.ESPCipherSuites (which validates the values).
 	ESPSuites []esp.Suite
 
+	// IKESuites restricts and orders the IKE SA (SK{} envelope) suites offered
+	// at IKE_SA_INIT and on IKE SA rekeys, in preference order. nil/empty
+	// offers the full built-in table. Resolved from ipsec.Config.IKECipherSuites
+	// (which validates the values).
+	IKESuites []ikesa.Suite
+
 	// RequestIPv6 asks the responder for an inner IPv6 address (CFG) and offers
 	// IPv6 traffic selectors. Resolved from ipsec.Config.RequestIPv6; a v4-only
 	// responder simply does not assign one and behaviour is unchanged.
@@ -316,10 +322,11 @@ func (s *Session) buildSAInit(cookie []byte) (*ikemsg.Message, []byte, error) {
 	if len(cookie) > 0 {
 		m.Payloads = append(m.Payloads, &ikemsg.NotifyPayload{Type: ikemsg.NotifyCookie, Data: cookie})
 	}
-	// Offer both groups (x25519 preferred, MODP-2048 fallback); the KE carries our
-	// current group, which the INVALID_KE_PAYLOAD retry may switch.
+	// Offer one proposal per enabled IKE suite, each advertising both groups
+	// (x25519 preferred, MODP-2048 fallback); the KE carries our current group,
+	// which the INVALID_KE_PAYLOAD retry may switch.
 	m.Payloads = append(m.Payloads,
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposal(1, ikemsg.DH_X25519, ikemsg.DH_MODP2048)}},
+		&ikemsg.SAPayload{Proposals: buildIKEProposals(s.enabledIKESuites(), ikemsg.DH_X25519, ikemsg.DH_MODP2048)},
 		&ikemsg.KEPayload{Group: s.dh.Group, Data: s.dh.Public},
 		&ikemsg.NoncePayload{Data: s.nonceI},
 	)
@@ -362,14 +369,22 @@ func (s *Session) handleSAInitResponse(raw []byte) error {
 
 	var (
 		gotSA, gotKE, gotNonce bool
+		suite                  ikeSuite
 		natNotifies            []*ikemsg.NotifyPayload
 		notifyErr              error
 	)
 	for _, p := range m.Payloads {
 		switch payload := p.(type) {
 		case *ikemsg.SAPayload:
-			if len(payload.Proposals) == 0 || !matchesIKESuite(payload.Proposals[0]) {
-				return errors.New("session: responder selected an unsupported IKE proposal")
+			// The response must be a strict narrowed SELECTION of one enabled
+			// suite: the suite fixes the SKEYSEED split (RFC 5282 §7), so an
+			// ambiguous echo or a suite we did not offer must be rejected.
+			if len(payload.Proposals) == 0 {
+				return errors.New("session: IKE_SA_INIT response carries no proposal")
+			}
+			var ok bool
+			if suite, ok = selectedIKESuite(payload.Proposals[0], s.enabledIKESuites()); !ok {
+				return fmt.Errorf("session: responder selected an unsupported or ambiguous IKE proposal (%s)", describeProposals(payload))
 			}
 			// The responder's narrowed proposal must carry the same DH group as our
 			// KEi; a different group would mean it should have sent INVALID_KE_PAYLOAD
@@ -409,14 +424,15 @@ func (s *Session) handleSAInitResponse(raw []byte) error {
 		return fmt.Errorf("session: DH: %w", err)
 	}
 	sa := &ikesa.IKESA{}
-	if err := sa.Derive(ikesa.Initiator, s.initiatorSPI, s.responderSPI, s.nonceI, s.nonceR, shared); err != nil {
+	if err := sa.Derive(suite.id, ikesa.Initiator, s.initiatorSPI, s.responderSPI, s.nonceI, s.nonceR, shared); err != nil {
 		return fmt.Errorf("session: derive IKE keys: %w", err)
 	}
 	s.ikeSA = sa
 	s.ikeDHGroup = s.dh.Group
 	s.log.Debug("IKE_SA_INIT complete",
 		"initiatorSPI", fmt.Sprintf("%016x", s.initiatorSPI),
-		"responderSPI", fmt.Sprintf("%016x", s.responderSPI))
+		"responderSPI", fmt.Sprintf("%016x", s.responderSPI),
+		"suite", suite.name())
 	return nil
 }
 

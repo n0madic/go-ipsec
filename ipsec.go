@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/n0madic/go-ipsec/internal/esp"
+	"github.com/n0madic/go-ipsec/internal/ikesa"
 	"github.com/n0madic/go-ipsec/internal/secretmem"
 	"github.com/n0madic/go-ipsec/internal/session"
 	"github.com/n0madic/go-ipsec/internal/tunnel"
@@ -338,6 +339,7 @@ func toSessionConfig(cfg Config) session.Config {
 		RekeyMaxPackets:  cfg.RekeyMaxPackets,
 		ChildSAPFS:       cfg.ChildSAPFS,
 		ESPSuites:        espSuitesFromConfig(cfg.ESPCipherSuites),
+		IKESuites:        ikeSuitesFromConfig(cfg.IKECipherSuites),
 		RequestIPv6:      cfg.requestIPv6Enabled(),
 		RetransmitBase:   DefaultRetransmitBase,
 		RetransmitMax:    DefaultRetransmitMax,
@@ -371,6 +373,22 @@ func espSuitesFromConfig(suites []CipherSuite) []esp.Suite {
 	out := make([]esp.Suite, 0, len(suites))
 	for _, cs := range suites {
 		if id, ok := cs.espSuite(); ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// ikeSuitesFromConfig maps the public IKECipherSuites (already validated) into
+// internal IKE SA suite ids, preserving the preference order; nil stays nil
+// (the session then offers its full built-in table).
+func ikeSuitesFromConfig(suites []CipherSuite) []ikesa.Suite {
+	if len(suites) == 0 {
+		return nil
+	}
+	out := make([]ikesa.Suite, 0, len(suites))
+	for _, cs := range suites {
+		if id, ok := cs.ikeSuite(); ok {
 			out = append(out, id)
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"math/big"
 	"testing"
@@ -140,15 +141,16 @@ func TestDH(t *testing.T) {
 }
 
 // TestDeriveRekeyIKE checks that the IKE-SA rekey derivation (RFC 7296 §2.18)
-// agrees across roles and differs from the initial derivation.
+// agrees across roles, differs from the initial derivation, and can move the
+// new SA to any negotiable suite (a rekey may change the envelope suite).
 func TestDeriveRekeyIKE(t *testing.T) {
 	ni := bytes.Repeat([]byte{0x77}, 32)
 	nr := bytes.Repeat([]byte{0x88}, 32)
 	dh := bytes.Repeat([]byte{0x99}, modp2048Len)
 
-	// An initial SA gives us an SK_d to key the rekey SKEYSEED.
+	// An initial (CBC) SA gives us an SK_d to key the rekey SKEYSEED.
 	base := &IKESA{}
-	if err := base.Derive(Initiator, 1, 2, ni, nr, dh); err != nil {
+	if err := base.Derive(SuiteAESCBC256SHA256, Initiator, 1, 2, ni, nr, dh); err != nil {
 		t.Fatal(err)
 	}
 
@@ -157,35 +159,39 @@ func TestDeriveRekeyIKE(t *testing.T) {
 	newDH := bytes.Repeat([]byte{0xCC}, modp2048Len)
 	const spii, spir = 0xDEAD, 0xBEEF
 
-	ri, err := DeriveRekeyIKE(base.SKd, Initiator, spii, spir, newNi, newNr, newDH)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rr, err := DeriveRekeyIKE(base.SKd, Responder, spii, spir, newNi, newNr, newDH)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(ri.SKei, rr.SKei) || !bytes.Equal(ri.SKar, rr.SKar) || !bytes.Equal(ri.SKd, rr.SKd) {
-		t.Fatal("rekey derivation disagrees across roles")
-	}
-	if bytes.Equal(ri.SKd, base.SKd) {
-		t.Fatal("rekeyed SK_d must differ from the original")
-	}
-	// And the rekeyed SAs encrypt/decrypt across roles.
-	sk, err := ri.EncryptToSK([]byte("rekey payload"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	msg := append([]byte{}, sk...)
-	if err := ri.Checksum(msg); err != nil {
-		t.Fatal(err)
-	}
-	if !rr.VerifyChecksum(msg) {
-		t.Fatal("rekeyed responder failed to verify initiator ICV")
-	}
-	got, err := rr.DecryptSK(msg)
-	if err != nil || string(got) != "rekey payload" {
-		t.Fatalf("rekey SK round-trip failed: %v %q", err, got)
+	for _, suite := range allSuites {
+		t.Run(suite.String(), func(t *testing.T) {
+			ri, err := DeriveRekeyIKE(suite, base.SKd, Initiator, spii, spir, newNi, newNr, newDH)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rr, err := DeriveRekeyIKE(suite, base.SKd, Responder, spii, spir, newNi, newNr, newDH)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ri.Suite != suite || rr.Suite != suite {
+				t.Fatalf("rekeyed SA suite = %v/%v, want %v", ri.Suite, rr.Suite, suite)
+			}
+			if !bytes.Equal(ri.SKei, rr.SKei) || !bytes.Equal(ri.SKar, rr.SKar) || !bytes.Equal(ri.SKd, rr.SKd) {
+				t.Fatal("rekey derivation disagrees across roles")
+			}
+			if bytes.Equal(ri.SKd, base.SKd) {
+				t.Fatal("rekeyed SK_d must differ from the original")
+			}
+			// And the rekeyed SAs encrypt/decrypt across roles.
+			sk, err := ri.EncryptToSK([]byte("rekey payload"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg := skFrame(sk)
+			if err := ri.FinalizeSK(msg, len(sk)); err != nil {
+				t.Fatal(err)
+			}
+			got, icvOK, err := rr.OpenSK(msg, msg[len(msg)-len(sk):])
+			if err != nil || !icvOK || string(got) != "rekey payload" {
+				t.Fatalf("rekey SK round-trip failed: icvOK=%v err=%v got=%q", icvOK, err, got)
+			}
+		})
 	}
 }
 
@@ -199,7 +205,7 @@ func TestDeriveChildKeysPFS(t *testing.T) {
 	dhShared := bytes.Repeat([]byte{0x33}, modp2048Len)
 
 	sa := &IKESA{}
-	if err := sa.Derive(Initiator, 1, 2, ni, nr, bytes.Repeat([]byte{0x44}, modp2048Len)); err != nil {
+	if err := sa.Derive(SuiteAESCBC256SHA256, Initiator, 1, 2, ni, nr, bytes.Repeat([]byte{0x44}, modp2048Len)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -307,60 +313,223 @@ func TestNewDHUnsupportedGroup(t *testing.T) {
 	}
 }
 
-// TestSKRoundTrip exercises the full SK{} envelope: derive keys, encrypt a
-// plaintext, checksum, verify, decrypt — and reject a tampered ICV.
+// allSuites enumerates every negotiable SK{} envelope suite.
+var allSuites = []Suite{SuiteAESCBC256SHA256, SuiteAESGCM256, SuiteChaCha20Poly1305}
+
+// skFrame wraps an EncryptToSK body into a minimal fake message frame — a
+// 28-byte header plus a 4-byte generic SK header, filled with deterministic
+// bytes (they become the AEAD AAD) — the shape FinalizeSK and OpenSK expect.
+// ikesa deliberately does not depend on the ikemsg codec, so tests hand-build
+// the frame.
+func skFrame(body []byte) []byte {
+	frame := make([]byte, ikeHdrLen+genericHdrLen, ikeHdrLen+genericHdrLen+len(body))
+	for i := range frame {
+		frame[i] = byte(i)
+	}
+	return append(frame, body...)
+}
+
+// TestSKRoundTrip exercises the full SK{} envelope for every suite: derive
+// keys, encrypt a plaintext, finalize, open across roles — and reject a
+// tampered header (AAD), body (IV/ciphertext) or trailing ICV/tag with
+// icvOK=false so the session layer's grace-decode retry semantics hold.
 func TestSKRoundTrip(t *testing.T) {
 	ni := bytes.Repeat([]byte{0x11}, 32)
 	nr := bytes.Repeat([]byte{0x22}, 32)
 	dh := bytes.Repeat([]byte{0x33}, modp2048Len)
 
-	init := &IKESA{}
-	if err := init.Derive(Initiator, 0xAAAA, 0xBBBB, ni, nr, dh); err != nil {
-		t.Fatal(err)
+	for _, suite := range allSuites {
+		t.Run(suite.String(), func(t *testing.T) {
+			init := &IKESA{}
+			if err := init.Derive(suite, Initiator, 0xAAAA, 0xBBBB, ni, nr, dh); err != nil {
+				t.Fatal(err)
+			}
+			resp := &IKESA{}
+			if err := resp.Derive(suite, Responder, 0xAAAA, 0xBBBB, ni, nr, dh); err != nil {
+				t.Fatal(err)
+			}
+			// Both ends must derive identical key material.
+			if !bytes.Equal(init.SKei, resp.SKei) || !bytes.Equal(init.SKar, resp.SKar) {
+				t.Fatal("derived keys disagree across roles")
+			}
+
+			for _, ptLen := range []int{0, 1, 15, 16, 17, 31, 200} {
+				plain := bytes.Repeat([]byte{0x5A}, ptLen)
+				sk, err := init.EncryptToSK(plain)
+				if err != nil {
+					t.Fatalf("encrypt len %d: %v", ptLen, err)
+				}
+				if suite.aead() {
+					// AEAD framing: IV(8) | plaintext | padLen(0) | tag(16), no alignment.
+					if len(sk) != aeadIVLen+ptLen+1+aeadTagLen {
+						t.Fatalf("AEAD SK body len %d for pt len %d, want %d", len(sk), ptLen, aeadIVLen+ptLen+1+aeadTagLen)
+					}
+				} else if (len(sk)-integICVLen-aesBlock)%aesBlock != 0 {
+					// CBC: IV + ≥1 block + ICV, block-aligned in the middle.
+					t.Fatalf("SK body not block aligned for len %d", ptLen)
+				}
+
+				msg := skFrame(sk)
+				if err := init.FinalizeSK(msg, len(sk)); err != nil {
+					t.Fatalf("finalize len %d: %v", ptLen, err)
+				}
+				got, icvOK, err := resp.OpenSK(msg, msg[len(msg)-len(sk):])
+				if err != nil || !icvOK {
+					t.Fatalf("open len %d: icvOK=%v err=%v", ptLen, icvOK, err)
+				}
+				if !bytes.Equal(got, plain) {
+					t.Fatalf("round-trip mismatch len %d:\n got %x\nwant %x", ptLen, got, plain)
+				}
+
+				// Tamper the header (the AEAD AAD / CBC ICV coverage), the first
+				// body byte (the IV) and the trailing tag/ICV byte → every one must
+				// fail with icvOK=false.
+				for _, idx := range []int{0, ikeHdrLen + genericHdrLen, len(msg) - 1} {
+					bad := append([]byte{}, msg...)
+					bad[idx] ^= 0xFF
+					if _, badOK, err := resp.OpenSK(bad, bad[len(bad)-len(sk):]); err == nil || badOK {
+						t.Fatalf("tampered byte %d accepted for len %d (icvOK=%v err=%v)", idx, ptLen, badOK, err)
+					}
+				}
+			}
+		})
 	}
-	resp := &IKESA{}
-	if err := resp.Derive(Responder, 0xAAAA, 0xBBBB, ni, nr, dh); err != nil {
-		t.Fatal(err)
+}
+
+// TestDeriveKeyLengthsPerSuite pins the RFC 5282 §7 key schedule: the AEAD
+// suites derive 36-byte SK_e* (32-byte key + 4-byte salt from the END of the
+// material) and NO SK_a*, while the CBC suite keeps 32/32; SK_d and SK_p* are
+// always the 32-byte PRF size. The directional salts must come from the tail
+// of the corresponding SK_e*.
+func TestDeriveKeyLengthsPerSuite(t *testing.T) {
+	ni := bytes.Repeat([]byte{0x11}, 32)
+	nr := bytes.Repeat([]byte{0x22}, 32)
+	dh := bytes.Repeat([]byte{0x33}, modp2048Len)
+
+	cases := []struct {
+		suite      Suite
+		encr, ineg int
+	}{
+		{SuiteAESCBC256SHA256, 32, 32},
+		{SuiteAESGCM256, 36, 0},
+		{SuiteChaCha20Poly1305, 36, 0},
 	}
-	// Both ends must derive identical key material.
-	if !bytes.Equal(init.SKei, resp.SKei) || !bytes.Equal(init.SKar, resp.SKar) {
-		t.Fatal("derived keys disagree across roles")
+	for _, tc := range cases {
+		t.Run(tc.suite.String(), func(t *testing.T) {
+			s := &IKESA{}
+			if err := s.Derive(tc.suite, Initiator, 1, 2, ni, nr, dh); err != nil {
+				t.Fatal(err)
+			}
+			if s.Suite != tc.suite {
+				t.Fatalf("Suite = %v, want %v", s.Suite, tc.suite)
+			}
+			if len(s.SKei) != tc.encr || len(s.SKer) != tc.encr {
+				t.Fatalf("SK_e lengths %d/%d, want %d", len(s.SKei), len(s.SKer), tc.encr)
+			}
+			if len(s.SKai) != tc.ineg || len(s.SKar) != tc.ineg {
+				t.Fatalf("SK_a lengths %d/%d, want %d", len(s.SKai), len(s.SKar), tc.ineg)
+			}
+			if len(s.SKd) != prfKeyLen || len(s.SKpi) != prfKeyLen || len(s.SKpr) != prfKeyLen {
+				t.Fatalf("SK_d/SK_p lengths %d/%d/%d, want %d", len(s.SKd), len(s.SKpi), len(s.SKpr), prfKeyLen)
+			}
+			if !tc.suite.aead() {
+				return
+			}
+			if s.outAEAD == nil || s.inAEAD == nil {
+				t.Fatal("AEAD primitives not constructed")
+			}
+			// Initiator role: outbound = SK_ei, inbound = SK_er; salts from the tail.
+			if !bytes.Equal(s.outSalt, s.SKei[32:]) || !bytes.Equal(s.inSalt, s.SKer[32:]) {
+				t.Fatal("directional salts are not the trailing 4 bytes of SK_e*")
+			}
+		})
 	}
+}
 
-	for _, ptLen := range []int{0, 1, 15, 16, 17, 31, 200} {
-		plain := bytes.Repeat([]byte{0x5A}, ptLen)
-		sk, err := init.EncryptToSK(plain)
-		if err != nil {
-			t.Fatalf("encrypt len %d: %v", ptLen, err)
-		}
-		// SK body must be IV + ≥1 block + ICV and block-aligned in the middle.
-		if (len(sk)-integICVLen-aesBlock)%aesBlock != 0 {
-			t.Fatalf("SK body not block aligned for len %d", ptLen)
-		}
+// TestAEADIVCounter pins the SK{} nonce discipline: consecutive EncryptToSK
+// calls burn strictly increasing IVs (the counter is the sole nonce-uniqueness
+// guarantee, together with the never-re-encode retransmit invariant).
+func TestAEADIVCounter(t *testing.T) {
+	ni := bytes.Repeat([]byte{0x11}, 32)
+	nr := bytes.Repeat([]byte{0x22}, 32)
+	dh := bytes.Repeat([]byte{0x33}, modp2048Len)
 
-		// Wrap as a minimal message: [body | ICV]; checksum then verify.
-		msg := append([]byte{}, sk...)
-		if err := init.Checksum(msg); err != nil {
-			t.Fatal(err)
-		}
-		if !resp.VerifyChecksum(msg) {
-			t.Fatalf("responder failed to verify ICV for len %d", ptLen)
-		}
+	for _, suite := range []Suite{SuiteAESGCM256, SuiteChaCha20Poly1305} {
+		t.Run(suite.String(), func(t *testing.T) {
+			s := &IKESA{}
+			if err := s.Derive(suite, Initiator, 1, 2, ni, nr, dh); err != nil {
+				t.Fatal(err)
+			}
+			sk1, err := s.EncryptToSK([]byte("one"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sk2, err := s.EncryptToSK([]byte("two"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			iv1 := binary.BigEndian.Uint64(sk1[:aeadIVLen])
+			iv2 := binary.BigEndian.Uint64(sk2[:aeadIVLen])
+			if iv2 != iv1+1 {
+				t.Fatalf("IVs not monotonic: %d then %d", iv1, iv2)
+			}
+		})
+	}
+}
 
-		got, err := resp.DecryptSK(msg)
-		if err != nil {
-			t.Fatalf("decrypt len %d: %v", ptLen, err)
-		}
-		if !bytes.Equal(got, plain) {
-			t.Fatalf("round-trip mismatch len %d:\n got %x\nwant %x", ptLen, got, plain)
-		}
+// TestOpenSKAcceptsPeerPadding: RFC 5282 §3 lets the peer pad the AEAD SK
+// plaintext (any pad content, self-described by the trailing Pad Length
+// octet). We always send padLen=0 but must accept a padded message — and
+// reject a pad length that overruns the authenticated plaintext (icvOK=true:
+// authentication succeeded, the peer is just malformed).
+func TestOpenSKAcceptsPeerPadding(t *testing.T) {
+	ni := bytes.Repeat([]byte{0x11}, 32)
+	nr := bytes.Repeat([]byte{0x22}, 32)
+	dh := bytes.Repeat([]byte{0x33}, modp2048Len)
 
-		// Tamper the ICV → must be rejected.
-		bad := append([]byte{}, msg...)
-		bad[len(bad)-1] ^= 0xFF
-		if resp.VerifyChecksum(bad) {
-			t.Fatalf("tampered ICV accepted for len %d", ptLen)
-		}
+	for _, suite := range []Suite{SuiteAESGCM256, SuiteChaCha20Poly1305} {
+		t.Run(suite.String(), func(t *testing.T) {
+			init := &IKESA{}
+			if err := init.Derive(suite, Initiator, 1, 2, ni, nr, dh); err != nil {
+				t.Fatal(err)
+			}
+			resp := &IKESA{}
+			if err := resp.Derive(suite, Responder, 1, 2, ni, nr, dh); err != nil {
+				t.Fatal(err)
+			}
+
+			// Hand-build a padded body: IV | plaintext | pad(7) | padLen(7) | tag.
+			plain := []byte("padded payload")
+			const padLen = 7
+			body := make([]byte, aeadIVLen+len(plain)+padLen+1+aeadTagLen)
+			binary.BigEndian.PutUint64(body[:aeadIVLen], 42)
+			copy(body[aeadIVLen:], plain)
+			body[aeadIVLen+len(plain)+padLen] = padLen
+			msg := skFrame(body)
+			if err := init.FinalizeSK(msg, len(body)); err != nil {
+				t.Fatal(err)
+			}
+			got, icvOK, err := resp.OpenSK(msg, msg[len(msg)-len(body):])
+			if err != nil || !icvOK {
+				t.Fatalf("padded SK rejected: icvOK=%v err=%v", icvOK, err)
+			}
+			if !bytes.Equal(got, plain) {
+				t.Fatalf("padded round-trip mismatch: got %x want %x", got, plain)
+			}
+
+			// A pad length exceeding the plaintext is malformed but authenticated:
+			// error with icvOK=true (retrying under another SA is pointless).
+			bad := make([]byte, aeadIVLen+1+aeadTagLen)
+			binary.BigEndian.PutUint64(bad[:aeadIVLen], 43)
+			bad[aeadIVLen] = 200
+			badMsg := skFrame(bad)
+			if err := init.FinalizeSK(badMsg, len(bad)); err != nil {
+				t.Fatal(err)
+			}
+			if _, icvOK, err := resp.OpenSK(badMsg, badMsg[len(badMsg)-len(bad):]); err == nil || !icvOK {
+				t.Fatalf("overrunning pad length: icvOK=%v err=%v, want icvOK=true with error", icvOK, err)
+			}
+		})
 	}
 }
 

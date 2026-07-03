@@ -46,13 +46,13 @@ func serverChildRekey(t *testing.T, respS *Session, msgID uint32, oldSPI, newSPI
 }
 
 // serverIKERekey builds a server-initiated IKE SA rekey request carrying an
-// 8-byte SPI proposal in the given DH group + Ni + that group's KE.
+// 8-byte SPI GCM-suite proposal in the given DH group + Ni + that group's KE.
 func serverIKERekey(t *testing.T, respS *Session, msgID uint32, spi uint64, group uint16, dhPub, ni []byte) []byte {
 	t.Helper()
 	var spiBuf [8]byte
 	binary.BigEndian.PutUint64(spiBuf[:], spi)
 	inner := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalSPI(1, spiBuf[:], group)}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcmIKESuite(), spiBuf[:], group)}},
 		&ikemsg.NoncePayload{Data: ni},
 		&ikemsg.KEPayload{Group: group, Data: dhPub},
 	}
@@ -1918,5 +1918,242 @@ func TestRekeyCompletionClearsQueuedReestablish(t *testing.T) {
 	}
 	if !initS.nextChildReestablish.IsZero() {
 		t.Fatal("stale re-establishment backoff survived rekey completion")
+	}
+}
+
+// TestIKERekeySuiteSwitch drives a we-initiated IKE SA rekey where the
+// responder (restricted to ChaCha20-Poly1305) narrows our three-suite offer to
+// ChaCha while the live envelope runs GCM: the response echoes the ChaCha
+// proposal number, both ends cut over, the new envelope runs the NEW suite,
+// and a probe message encoded by the initiator's new SA decodes under the
+// responder's new SA (the SKEYSEED split matched).
+func TestIKERekeySuiteSwitch(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t) // GCM envelope
+	initConn := initS.conn
+	respS.cfg.IKESuites = []ikesa.Suite{ikesa.SuiteChaCha20Poly1305}
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+
+	if err := initS.initiateIKERekey(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reqRaw, err := respConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr, inner, dec, err := respS.decodeIKE(reqRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := respS.handleIKERekeyRequest(ctx, hdr, inner, dec, false); err != nil {
+		t.Fatal(err)
+	}
+	if respS.ikeSA.Suite != ikesa.SuiteChaCha20Poly1305 {
+		t.Fatalf("responder new envelope suite = %v, want ChaCha", respS.ikeSA.Suite)
+	}
+
+	respRaw, err := initConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The narrowed response must echo the ChaCha proposal number from our offer
+	// (GCM=1, ChaCha=2, CBC=3). Decode it under the initiator's grace path
+	// state before handling: peek via the old (still-current) SA.
+	if exit := initS.handleInbound(ctx, respRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if initS.ikeSA.Suite != ikesa.SuiteChaCha20Poly1305 {
+		t.Fatalf("initiator new envelope suite = %v, want ChaCha", initS.ikeSA.Suite)
+	}
+	if initS.oldIKE == nil {
+		t.Fatal("initiator did not retain the old IKE SA for grace decode")
+	}
+
+	// Both new SAs must agree byte-for-byte on the wire.
+	probe, err := initS.encodeSKEmpty(ikemsg.ExchangeInformational, ikemsg.FlagInitiator, initS.messageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := respS.decodeIKE(probe); err != nil {
+		t.Fatalf("new IKE SAs disagree after the suite switch: %v", err)
+	}
+}
+
+// TestServerIKERekeyCombinedProposal: a server-initiated IKE rekey offering a
+// strongSwan-style combined AEAD proposal (GCM-256 and GCM-128 ENCR
+// alternatives) must be answered with a single narrowed proposal built from
+// the SELECTED suite — GCM-256, echoing the proposal number, exactly one ENCR,
+// no INTEG — and the new envelope must run GCM.
+func TestServerIKERekeyCombinedProposal(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+
+	dh, err := ikesa.NewDH(ikemsg.DH_MODP2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spi := bytes.Repeat([]byte{0x5C}, 8)
+	combined := ikemsg.Proposal{
+		Number: 3, Protocol: ikemsg.ProtocolIKE, SPI: spi,
+		Transforms: []ikemsg.Transform{
+			{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_AES_GCM_16, KeyLength: 256, HasKeyLength: true},
+			{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_AES_GCM_16, KeyLength: 128, HasKeyLength: true},
+			{Type: ikemsg.TransformPRF, ID: ikemsg.PRF_HMAC_SHA2_256},
+			{Type: ikemsg.TransformDH, ID: ikemsg.DH_MODP2048},
+		},
+	}
+	inner := ikemsg.Payloads{
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{combined}},
+		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xEE}, nonceLen)},
+		&ikemsg.KEPayload{Group: ikemsg.DH_MODP2048, Data: dh.Public},
+	}
+	reqRaw, err := encodeSKWith(respS.ikeSA, respS.initiatorSPI, respS.responderSPI,
+		ikemsg.ExchangeCreateChildSA, 0, 0, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+	if exit := initS.handleInbound(ctx, reqRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if initS.oldIKE == nil {
+		t.Fatal("did not cut over on the combined-proposal IKE rekey")
+	}
+	if initS.ikeSA.Suite != ikesa.SuiteAESGCM256 {
+		t.Fatalf("new envelope suite = %v, want GCM", initS.ikeSA.Suite)
+	}
+
+	respRaw, err := respConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, respInner, _, err := respS.decodeIKE(respRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saR *ikemsg.SAPayload
+	for _, p := range respInner {
+		if v, ok := p.(*ikemsg.SAPayload); ok {
+			saR = v
+		}
+	}
+	if saR == nil || len(saR.Proposals) != 1 {
+		t.Fatal("response missing a single narrowed SA proposal")
+	}
+	prop := saR.Proposals[0]
+	if prop.Number != 3 {
+		t.Fatalf("response echoed proposal number %d, want 3", prop.Number)
+	}
+	encrs := prop.ByType(ikemsg.TransformEncr)
+	if len(encrs) != 1 || encrs[0].ID != ikemsg.ENCR_AES_GCM_16 || encrs[0].KeyLength != 256 {
+		t.Fatalf("response ENCR not narrowed to GCM-256: %+v", encrs)
+	}
+	if len(prop.ByType(ikemsg.TransformInteg)) != 0 {
+		t.Fatal("narrowed AEAD IKE response carries an INTEG transform")
+	}
+	if len(prop.SPI) != 8 {
+		t.Fatalf("response proposal SPI length %d, want 8", len(prop.SPI))
+	}
+}
+
+// TestIKERekeyResponseAmbiguousRejected: an IKE rekey response whose proposal
+// still carries two ENCR alternatives is not a valid selection — the SKEYSEED
+// split would be undefined — so completeIKERekey must reject it without
+// cutting over.
+func TestIKERekeyResponseAmbiguousRejected(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+	oldSA := initS.ikeSA
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+	if err := initS.initiateIKERekey(ctx); err != nil {
+		t.Fatal(err)
+	}
+	msgID := initS.pending.msgID
+	offeredGroup := initS.pending.ike.dh.Group
+	if _, err := respConn.Recv(ctx); err != nil { // drain our request
+		t.Fatal(err)
+	}
+
+	dh, err := ikesa.NewDH(offeredGroup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ambiguous := buildIKEProposalForSuite(1, gcmIKESuite(), bytes.Repeat([]byte{0x5D}, 8), offeredGroup)
+	ambiguous.Transforms = append(ambiguous.Transforms,
+		ikemsg.Transform{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_CHACHA20_POLY1305})
+	resp := ikemsg.Payloads{
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{ambiguous}},
+		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xEF}, nonceLen)},
+		&ikemsg.KEPayload{Group: offeredGroup, Data: dh.Public},
+	}
+	respRaw, err := encodeSKWith(respS.ikeSA, respS.initiatorSPI, respS.responderSPI,
+		ikemsg.ExchangeCreateChildSA, ikemsg.FlagResponse, msgID, resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exit := initS.handleInbound(ctx, respRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if initS.ikeSA != oldSA || initS.oldIKE != nil {
+		t.Fatal("ambiguous IKE rekey response was installed (envelope cut over)")
+	}
+}
+
+// TestServerIKERekeyGroupNotOffered: a server IKE rekey whose KE claims group
+// 14 but whose only proposal advertises a different DH group must be declined
+// with INVALID_KE_PAYLOAD (carrying our preferred group) — the DH exchange may
+// only run against a proposal that offered the group. No cutover happens.
+func TestServerIKERekeyGroupNotOffered(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+
+	dh, err := ikesa.NewDH(ikemsg.DH_MODP2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Proposal advertises ONLY group 19 (ECP-256); the KE claims group 14.
+	prop := buildIKEProposalForSuite(1, gcmIKESuite(), bytes.Repeat([]byte{0x5E}, 8), 19)
+	inner := ikemsg.Payloads{
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{prop}},
+		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xDF}, nonceLen)},
+		&ikemsg.KEPayload{Group: ikemsg.DH_MODP2048, Data: dh.Public},
+	}
+	reqRaw, err := encodeSKWith(respS.ikeSA, respS.initiatorSPI, respS.responderSPI,
+		ikemsg.ExchangeCreateChildSA, 0, 0, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+	if exit := initS.handleInbound(ctx, reqRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if initS.oldIKE != nil {
+		t.Fatal("group mismatch must not cut the IKE SA over")
+	}
+	raw, err := respConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, respInner, _, err := respS.decodeIKE(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var grp []byte
+	var sawInvalidKE bool
+	for _, p := range respInner {
+		if n, ok := p.(*ikemsg.NotifyPayload); ok && n.Type == ikemsg.NotifyInvalidKEPayload {
+			sawInvalidKE = true
+			grp = n.Data
+		}
+	}
+	if !sawInvalidKE {
+		t.Fatal("KE-group/proposal mismatch not answered with INVALID_KE_PAYLOAD")
+	}
+	if len(grp) != 2 || binary.BigEndian.Uint16(grp) != ikemsg.DH_X25519 {
+		t.Fatalf("INVALID_KE_PAYLOAD did not carry group 31: %v", grp)
 	}
 }
