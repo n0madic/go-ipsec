@@ -29,16 +29,40 @@ const (
 
 // MSCHAPv2 carries the state of one EAP-MSCHAPv2 conversation from the peer
 // (initiator) side and the material the MSK derivation later needs.
+//
+// Password is bytes, not a string: a string is unwipeable and would pin the
+// secret for the process lifetime, while a byte copy can be zeroed by Wipe
+// once the conversation is done.
 type MSCHAPv2 struct {
 	Username string
-	Password string
+	Password []byte
 
 	peerChallenge    []byte
 	ntResponse       []byte
 	authChallenge    []byte
 	passwordHashHash []byte
-	authResponse     string // expected "S=..." from the server
+	authResponse     []byte // expected "S=..." from the server (password-derived)
 	authChecked      bool   // set once the server's AuthenticatorResponse verified
+}
+
+// NewMSCHAPv2 builds the conversation state with its own copy of the password,
+// allocated inside secretmem.Do so it is runtime-tracked, and safe for Wipe to
+// zero without touching a buffer the caller still owns.
+func NewMSCHAPv2(username string, password []byte) *MSCHAPv2 {
+	m := &MSCHAPv2{Username: username}
+	secretmem.Do(func() { m.Password = append([]byte(nil), password...) })
+	return m
+}
+
+// Wipe zeroes the password copy and every password-derived buffer. The
+// conversation state is unusable afterwards; call it once the MSK has been
+// derived (or the handshake failed).
+func (m *MSCHAPv2) Wipe() {
+	for _, b := range [][]byte{m.Password, m.peerChallenge, m.ntResponse, m.authChallenge, m.passwordHashHash, m.authResponse} {
+		secretmem.Wipe(b)
+	}
+	m.Password, m.peerChallenge, m.ntResponse = nil, nil, nil
+	m.authChallenge, m.passwordHashHash, m.authResponse = nil, nil, nil
 }
 
 // HandleChallenge consumes a Request/MSCHAPv2-Challenge and produces the
@@ -72,7 +96,7 @@ func (m *MSCHAPv2) HandleChallenge(req Packet) (Packet, error) {
 	var cerr error
 	secretmem.Do(func() {
 		username := []byte(m.Username)
-		ntResp, err := rfc2759.GenerateNTResponse(m.authChallenge, peerChal, username, []byte(m.Password))
+		ntResp, err := rfc2759.GenerateNTResponse(m.authChallenge, peerChal, username, m.Password)
 		if err != nil {
 			cerr = fmt.Errorf("eap: NT-Response: %w", err)
 			return
@@ -80,7 +104,7 @@ func (m *MSCHAPv2) HandleChallenge(req Packet) (Packet, error) {
 		m.ntResponse = ntResp
 
 		// password-hash-hash = NtPasswordHash(NtPasswordHash(unicode(password))).
-		ucs2, err := rfc2759.ToUTF16([]byte(m.Password))
+		ucs2, err := rfc2759.ToUTF16(m.Password)
 		if err != nil {
 			cerr = err
 			return
@@ -88,12 +112,12 @@ func (m *MSCHAPv2) HandleChallenge(req Packet) (Packet, error) {
 		m.passwordHashHash = rfc2759.NTPasswordHash(rfc2759.NTPasswordHash(ucs2))
 
 		// Pre-compute the AuthenticatorResponse we expect the server to send back.
-		authResp, err := rfc2759.GenerateAuthenticatorResponse(m.authChallenge, peerChal, ntResp, username, []byte(m.Password))
+		authResp, err := rfc2759.GenerateAuthenticatorResponse(m.authChallenge, peerChal, ntResp, username, m.Password)
 		if err != nil {
 			cerr = fmt.Errorf("eap: AuthenticatorResponse: %w", err)
 			return
 		}
-		m.authResponse = authResp
+		m.authResponse = []byte(authResp)
 	})
 	if cerr != nil {
 		return Packet{}, cerr
@@ -145,13 +169,13 @@ func (m *MSCHAPv2) HandleSuccess(req Packet) (Packet, error) {
 	// the password hash) instead of a short-circuiting strings.HasPrefix.
 	msg := messageBody(d)
 	exp := m.authResponse
-	if exp == "" {
+	if len(exp) == 0 {
 		// No Challenge was processed, so there is no expected AuthenticatorResponse.
 		// An empty expectation makes the constant-time compare below trivially pass,
 		// which would accept an unsolicited Success as verified — reject it instead.
 		return Packet{}, errors.New("eap: unexpected MSCHAPv2 Success before Challenge")
 	}
-	if len(msg) < len(exp) || subtle.ConstantTimeCompare([]byte(msg[:len(exp)]), []byte(exp)) != 1 {
+	if len(msg) < len(exp) || subtle.ConstantTimeCompare([]byte(msg[:len(exp)]), exp) != 1 {
 		return Packet{}, errors.New("eap: server AuthenticatorResponse mismatch")
 	}
 	m.authChecked = true

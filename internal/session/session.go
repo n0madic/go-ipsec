@@ -17,6 +17,7 @@ import (
 
 	"github.com/n0madic/go-ipsec/internal/ikemsg"
 	"github.com/n0madic/go-ipsec/internal/ikesa"
+	"github.com/n0madic/go-ipsec/internal/secretmem"
 	"github.com/n0madic/go-ipsec/internal/transport"
 )
 
@@ -32,12 +33,15 @@ type WireID struct {
 }
 
 // Config is the internal session configuration translated from ipsec.Config.
+// EAPPass and PSK are bytes, not strings: the session owns these copies
+// (toSessionConfig allocates them fresh, inside secretmem.Do) and wipes them
+// on Close — a string would be unwipeable for the process lifetime.
 type Config struct {
 	Server   string
 	LocalID  WireID
 	RemoteID WireID
 	EAPUser  string
-	EAPPass  string
+	EAPPass  []byte
 	PSK      []byte
 	RootCAs  *x509.CertPool
 	Dialer   transport.DialFunc
@@ -91,7 +95,6 @@ type Session struct {
 	// IKE_AUTH / Child SA state.
 	childInitiatorSPI uint32
 	remoteIDr         WireID
-	msk               []byte
 	child             *ChildSA
 	assigned          Assigned
 	established       bool
@@ -447,8 +450,12 @@ func saInitInvalidKE(raw []byte) (uint16, bool) {
 	return 0, false
 }
 
-// Close tears down the transport. Graceful DELETE is added in Phase 3.
+// Close tears down the transport and wipes the session's credential copies
+// (best-effort in the default build; with runtime/secret active they are also
+// erased by the GC once dropped — see internal/secretmem).
 func (s *Session) Close() error {
+	secretmem.Wipe(s.cfg.PSK)
+	secretmem.Wipe(s.cfg.EAPPass)
 	if s.conn != nil {
 		return s.conn.Close()
 	}

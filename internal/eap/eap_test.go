@@ -129,7 +129,7 @@ func TestPacketRoundTrip(t *testing.T) {
 // TestChallengeResponseFlow drives HandleChallenge → HandleSuccess with a
 // server emulated from the same RFC primitives.
 func TestChallengeResponseFlow(t *testing.T) {
-	m := &MSCHAPv2{Username: "User", Password: "clientPass"}
+	m := &MSCHAPv2{Username: "User", Password: []byte("clientPass")}
 	authChal := unhex(t, rfc2759AuthChal)
 
 	// Build a server Challenge packet.
@@ -190,7 +190,7 @@ func TestVerifiedGate(t *testing.T) {
 	}
 
 	// Happy path: not verified after the challenge, verified after the Success.
-	m := &MSCHAPv2{Username: "User", Password: "clientPass"}
+	m := &MSCHAPv2{Username: "User", Password: []byte("clientPass")}
 	if _, err := m.HandleChallenge(Packet{Code: CodeRequest, Identifier: 1, Type: TypeMSCHAPv2, Data: challenge()}); err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestVerifiedGate(t *testing.T) {
 	}
 
 	// A failed AuthenticatorResponse check must not flip Verified().
-	bad := &MSCHAPv2{Username: "User", Password: "clientPass"}
+	bad := &MSCHAPv2{Username: "User", Password: []byte("clientPass")}
 	if _, err := bad.HandleChallenge(Packet{Code: CodeRequest, Identifier: 1, Type: TypeMSCHAPv2, Data: challenge()}); err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestVerifiedGate(t *testing.T) {
 // constant-time compare pass vacuously. It must now be rejected and leave the
 // session unverified.
 func TestHandleSuccessBeforeChallenge(t *testing.T) {
-	m := &MSCHAPv2{Username: "User", Password: "clientPass"}
+	m := &MSCHAPv2{Username: "User", Password: []byte("clientPass")}
 	sucData := []byte{opSuccess, 0x42, 0, 0}
 	putUint16(sucData[2:4], uint16(len(sucData)))
 	if _, err := m.HandleSuccess(Packet{Code: CodeRequest, Identifier: 1, Type: TypeMSCHAPv2, Data: sucData}); err == nil {
@@ -234,5 +234,53 @@ func TestHandleSuccessBeforeChallenge(t *testing.T) {
 	}
 	if m.Verified() {
 		t.Fatal("Verified() true after an unsolicited Success")
+	}
+}
+
+// TestNewMSCHAPv2CopiesPassword: the conversation owns a private copy, so
+// Wipe cannot zero a buffer the caller still uses (and vice versa — the
+// caller mutating its buffer does not corrupt an in-flight conversation).
+func TestNewMSCHAPv2CopiesPassword(t *testing.T) {
+	orig := []byte("clientPass")
+	m := NewMSCHAPv2("User", orig)
+	orig[0] = 'X'
+	if string(m.Password) != "clientPass" {
+		t.Fatalf("conversation password aliases the caller's buffer: %q", m.Password)
+	}
+	m.Wipe()
+	if string(orig[1:]) != "lientPass" {
+		t.Fatal("Wipe zeroed the caller's buffer")
+	}
+}
+
+// TestWipeZeroesDerivedMaterial: after a challenge round, Wipe zeroes the
+// password copy and every password-derived buffer and nils the fields.
+func TestWipeZeroesDerivedMaterial(t *testing.T) {
+	m := NewMSCHAPv2("User", []byte("clientPass"))
+	authChal := unhex(t, rfc2759AuthChal)
+	chalData := []byte{opChallenge, 0x42, 0, 0, authChallengeLen}
+	chalData = append(chalData, authChal...)
+	chalData = append(chalData, []byte("server.example")...)
+	putUint16(chalData[2:4], uint16(len(chalData)))
+	if _, err := m.HandleChallenge(Packet{Code: CodeRequest, Identifier: 1, Type: TypeMSCHAPv2, Data: chalData}); err != nil {
+		t.Fatal(err)
+	}
+	// Keep references to the backing arrays to observe the zeroing.
+	held := [][]byte{m.Password, m.ntResponse, m.passwordHashHash, m.authResponse, m.peerChallenge, m.authChallenge}
+	for i, b := range held {
+		if len(b) == 0 {
+			t.Fatalf("buffer %d empty before Wipe", i)
+		}
+	}
+	m.Wipe()
+	for i, b := range held {
+		for _, v := range b {
+			if v != 0 {
+				t.Fatalf("buffer %d not zeroed by Wipe", i)
+			}
+		}
+	}
+	if m.Password != nil || m.ntResponse != nil || m.passwordHashHash != nil || m.authResponse != nil {
+		t.Fatal("Wipe did not nil the fields")
 	}
 }

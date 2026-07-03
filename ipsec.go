@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/n0madic/go-ipsec/internal/esp"
+	"github.com/n0madic/go-ipsec/internal/secretmem"
 	"github.com/n0madic/go-ipsec/internal/session"
 	"github.com/n0madic/go-ipsec/internal/tunnel"
 	"github.com/n0madic/go-ipsec/internal/workers"
@@ -316,14 +317,14 @@ func (c *Client) Close() error {
 }
 
 // toSessionConfig translates the public Config into the internal session form.
+// Called per dial (including every reconnect), so each session gets its own
+// credential copies and may wipe them on Close without affecting the next one.
 func toSessionConfig(cfg Config) session.Config {
 	sc := session.Config{
 		Server:           cfg.Server,
 		LocalID:          session.WireID{Type: cfg.LocalID.idType(), Data: cfg.LocalID.idData()},
 		RemoteID:         session.WireID{Type: cfg.RemoteID.idType(), Data: cfg.RemoteID.idData()},
 		EAPUser:          cfg.EAP.Username,
-		EAPPass:          cfg.EAP.Password,
-		PSK:              []byte(cfg.PSK),
 		RootCAs:          cfg.RootCAs,
 		MTU:              cfg.MTU,
 		Logger:           cfg.Logger,
@@ -339,6 +340,18 @@ func toSessionConfig(cfg Config) session.Config {
 		RetransmitMax:    DefaultRetransmitMax,
 		RetransmitTries:  DefaultRetransmitTries,
 	}
+	// Copy the credentials inside secretmem.Do: the session's long-lived
+	// byte copies are then runtime-tracked (erased by the GC once the session
+	// is dropped) and are additionally wiped by Session.Close. The caller's
+	// original strings remain untracked — documented in internal/secretmem.
+	secretmem.Do(func() {
+		if cfg.PSK != "" {
+			sc.PSK = []byte(cfg.PSK)
+		}
+		if cfg.EAP.Password != "" {
+			sc.EAPPass = []byte(cfg.EAP.Password)
+		}
+	})
 	if cfg.Transport != nil {
 		sc.Dialer = cfg.Transport.DialPacket
 	}

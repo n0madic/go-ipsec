@@ -396,8 +396,15 @@ make test-secret   # offline suite with the experiment enabled
 
 Erasure is effective on **linux/amd64 and linux/arm64** (Go 1.26+); on other
 platforms, and in the default build, the seam compiles to a direct call with
-no overhead and no erasure guarantee. Caller-provided secrets (`Config.PSK`,
-the EAP password string) are allocated outside the seam and are not tracked.
+no overhead and no erasure guarantee.
+
+Independently of the experiment, the library never keeps credentials as
+strings internally: the session takes private byte copies of `Config.PSK` and
+the EAP password, wipes them on teardown, and the MSCHAPv2 state (password
+copy, NT-Response, password hashes) is zeroed as soon as IKE_AUTH completes —
+rekeys never need the password again. The one thing out of reach is the
+original string the caller placed in `Config`; strings are immutable and live
+until the process exits.
 
 ## Limitations
 

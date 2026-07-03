@@ -135,7 +135,12 @@ func (s *Session) ikeAuthEAP(ctx context.Context) error {
 	}
 
 	// --- EAP loop. ---
-	mschap := &eap.MSCHAPv2{Username: s.cfg.EAPUser, Password: s.cfg.EAPPass}
+	// The conversation owns a private tracked copy of the password; wipe it
+	// (and every password-derived buffer) as soon as IKE_AUTH is over — the
+	// MSK is the only thing the rest of the session needs, and rekeys use
+	// SK_d, never the password.
+	mschap := eap.NewMSCHAPv2(s.cfg.EAPUser, s.cfg.EAPPass)
+	defer mschap.Wipe()
 	for round := 0; ; round++ {
 		if round >= maxEAPRounds {
 			return fmt.Errorf("session: EAP did not converge within %d rounds", maxEAPRounds)
@@ -181,12 +186,14 @@ func (s *Session) ikeAuthEAP(ctx context.Context) error {
 	}
 
 	// --- EAP done: derive MSK and send the initiator AUTH. ---
+	// The MSK stays local: after the AUTH exchange below nothing needs it
+	// (IKE rekeys are keyed by SK_d), so it is dropped — and, with
+	// runtime/secret active, erased — when this function returns.
 	phh, ntResp := mschap.MSKInputs()
 	msk, err := eap.DeriveMSK(phh, ntResp)
 	if err != nil {
 		return fmt.Errorf("session: derive MSK: %w", err)
 	}
-	s.msk = msk
 
 	initiatorAuth := s.computeInitiatorAuth(msk)
 	authPayloads := ikemsg.Payloads{&ikemsg.AuthPayload{Method: auth.MethodSharedKeyMIC, Data: initiatorAuth}}

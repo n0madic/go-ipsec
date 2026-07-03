@@ -575,3 +575,25 @@ func TestCompleteMatchingRekeyGuards(t *testing.T) {
 		t.Fatal("live rekey pending consumed by a stale old-SA response")
 	}
 }
+
+// TestCloseWipesCredentialCopies: the session owns its PSK/EAP-password byte
+// copies (toSessionConfig allocates them fresh per dial), and Close zeroes
+// them so the credentials do not outlive the session in the default
+// (no-runtime/secret) build.
+func TestCloseWipesCredentialCopies(t *testing.T) {
+	s, _, _ := mirrorSessions(t)
+	s.cfg.PSK = []byte("preshared-secret")
+	s.cfg.EAPPass = []byte("eap-password")
+	psk, pass := s.cfg.PSK, s.cfg.EAPPass
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range [][]byte{psk, pass} {
+		for _, v := range b {
+			if v != 0 {
+				t.Fatal("Close did not wipe the credential copy")
+			}
+		}
+	}
+}
