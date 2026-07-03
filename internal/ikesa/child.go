@@ -1,5 +1,7 @@
 package ikesa
 
+import "github.com/n0madic/go-ipsec/internal/secretmem"
+
 // ChildKeys holds the directional ESP key material for one Child SA. Names are
 // from the initiator's point of view: the "I→R" pair is what this client uses
 // to protect outbound packets, the "R→I" pair what it uses to verify and
@@ -37,25 +39,31 @@ func (s *IKESA) DeriveChildKeysPFS(dhShared, nonceI, nonceR []byte, encrLen, int
 }
 
 // deriveChildKeys is the shared KEYMAT expansion. dhShared is prepended to the
-// prf+ seed for PFS and is nil (a no-op append) for the non-PFS case.
+// prf+ seed for PFS and is nil (a no-op append) for the non-PFS case. It runs
+// inside secretmem.Do so the ESP key buffers (and the KEYMAT intermediate) are
+// runtime-tracked and erased once the Child SA is dropped on rekey or teardown.
 func (s *IKESA) deriveChildKeys(dhShared, nonceI, nonceR []byte, encrLen, integLen int) ChildKeys {
-	seed := make([]byte, 0, len(dhShared)+len(nonceI)+len(nonceR))
-	seed = append(seed, dhShared...)
-	seed = append(seed, nonceI...)
-	seed = append(seed, nonceR...)
-	ks := prfPlus(s.SKd, seed, 2*(encrLen+integLen))
+	var ck ChildKeys
+	secretmem.Do(func() {
+		seed := make([]byte, 0, len(dhShared)+len(nonceI)+len(nonceR))
+		seed = append(seed, dhShared...)
+		seed = append(seed, nonceI...)
+		seed = append(seed, nonceR...)
+		ks := prfPlus(s.SKd, seed, 2*(encrLen+integLen))
 
-	var off int
-	take := func(n int) []byte {
-		b := make([]byte, n)
-		copy(b, ks[off:off+n])
-		off += n
-		return b
-	}
-	return ChildKeys{
-		EncrIR:  take(encrLen),
-		IntegIR: take(integLen),
-		EncrRI:  take(encrLen),
-		IntegRI: take(integLen),
-	}
+		var off int
+		take := func(n int) []byte {
+			b := make([]byte, n)
+			copy(b, ks[off:off+n])
+			off += n
+			return b
+		}
+		ck = ChildKeys{
+			EncrIR:  take(encrLen),
+			IntegIR: take(integLen),
+			EncrRI:  take(encrLen),
+			IntegRI: take(integLen),
+		}
+	})
+	return ck
 }

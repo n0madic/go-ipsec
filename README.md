@@ -29,6 +29,7 @@ and to route them into proxy-service rotation via a SOCKS5 sidecar
 - [Architecture](#architecture)
 - [Project layout](#project-layout)
 - [Testing](#testing)
+- [Hardening: key-material erasure](#hardening-key-material-erasure)
 - [Limitations](#limitations)
 - [License](#license)
 
@@ -377,6 +378,26 @@ make e2e-down    # stop and remove the server
 See [`test/strongswan/README.md`](test/strongswan/README.md) for running the
 server by hand, exercising the lifecycle (DPD, rekey, graceful DELETE), and
 capturing packets.
+
+## Hardening: key-material erasure
+
+Every key derivation (IKE SK_\*, ESP keys, DH private keys and shared secrets,
+the EAP MSK and MSCHAPv2 password hashes) runs through a thin seam over the
+experimental [`runtime/secret`](https://pkg.go.dev/runtime/secret) package.
+Build with the experiment enabled and the runtime erases that key material —
+registers, stack, and the heap allocations holding the keys — as soon as the
+GC finds it unreachable (e.g. the old SA's keys right after a rekey, or
+everything on teardown):
+
+```sh
+GOEXPERIMENT=runtimesecret go build ./...
+make test-secret   # offline suite with the experiment enabled
+```
+
+Erasure is effective on **linux/amd64 and linux/arm64** (Go 1.26+); on other
+platforms, and in the default build, the seam compiles to a direct call with
+no overhead and no erasure guarantee. Caller-provided secrets (`Config.PSK`,
+the EAP password string) are allocated outside the seam and are not tracked.
 
 ## Limitations
 

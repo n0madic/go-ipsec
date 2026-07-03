@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
+
+	"github.com/n0madic/go-ipsec/internal/secretmem"
 )
 
 const (
@@ -52,7 +54,17 @@ type SA struct {
 // NewSA builds a Child SA transform. outSPI is the responder's SPI (placed in
 // outbound packets); inSPI is our SPI (matched on inbound). The key arguments
 // are the directional ESP keys (AES-256 encryption, HMAC-SHA2-256 integrity).
+// Construction runs inside secretmem.Do so the AES key schedules and integrity
+// key copies are runtime-tracked and erased once the SA is dropped on rekey or
+// teardown (see internal/secretmem).
 func NewSA(outSPI, inSPI uint32, outEncr, outInteg, inEncr, inInteg []byte, replayWindow uint32) (*SA, error) {
+	var sa *SA
+	var err error
+	secretmem.Do(func() { sa, err = newSA(outSPI, inSPI, outEncr, outInteg, inEncr, inInteg, replayWindow) })
+	return sa, err
+}
+
+func newSA(outSPI, inSPI uint32, outEncr, outInteg, inEncr, inInteg []byte, replayWindow uint32) (*SA, error) {
 	ob, err := aes.NewCipher(outEncr)
 	if err != nil {
 		return nil, fmt.Errorf("esp: outbound cipher: %w", err)

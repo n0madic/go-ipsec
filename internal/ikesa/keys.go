@@ -4,6 +4,8 @@ import (
 	"crypto/hmac"
 	"encoding/binary"
 	"errors"
+
+	"github.com/n0madic/go-ipsec/internal/secretmem"
 )
 
 // Role identifies which end of the IKE SA this client plays. go-ipsec is
@@ -54,9 +56,14 @@ func (s *IKESA) Derive(role Role, spii, spir uint64, nonceI, nonceR, dhShared []
 	if len(dhShared) == 0 {
 		return errors.New("ikesa: empty DH shared secret")
 	}
-	// Initial SKEYSEED = prf(Ni | Nr, g^ir) (RFC 7296 §2.14).
-	skeyseed := prf(concat(nonceI, nonceR), dhShared)
-	s.deriveFromSKEYSEED(role, spii, spir, nonceI, nonceR, skeyseed)
+	// Derive inside secretmem.Do: the SK_* buffers (and the SKEYSEED
+	// intermediate) are then runtime-tracked and erased once this IKESA is
+	// dropped on rekey or teardown (see internal/secretmem).
+	secretmem.Do(func() {
+		// Initial SKEYSEED = prf(Ni | Nr, g^ir) (RFC 7296 §2.14).
+		skeyseed := prf(concat(nonceI, nonceR), dhShared)
+		s.deriveFromSKEYSEED(role, spii, spir, nonceI, nonceR, skeyseed)
+	})
 	return nil
 }
 
@@ -77,14 +84,17 @@ func DeriveRekeyIKE(oldSKd []byte, role Role, spii, spir uint64, nonceI, nonceR,
 	if len(dhShared) == 0 {
 		return nil, errors.New("ikesa: empty rekey DH shared secret")
 	}
-	seed := make([]byte, 0, len(dhShared)+len(nonceI)+len(nonceR))
-	seed = append(seed, dhShared...)
-	seed = append(seed, nonceI...)
-	seed = append(seed, nonceR...)
-	skeyseed := prf(oldSKd, seed)
+	var s *IKESA
+	secretmem.Do(func() {
+		seed := make([]byte, 0, len(dhShared)+len(nonceI)+len(nonceR))
+		seed = append(seed, dhShared...)
+		seed = append(seed, nonceI...)
+		seed = append(seed, nonceR...)
+		skeyseed := prf(oldSKd, seed)
 
-	s := &IKESA{}
-	s.deriveFromSKEYSEED(role, spii, spir, nonceI, nonceR, skeyseed)
+		s = &IKESA{}
+		s.deriveFromSKEYSEED(role, spii, spir, nonceI, nonceR, skeyseed)
+	})
 	return s, nil
 }
 

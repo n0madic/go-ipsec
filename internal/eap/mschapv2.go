@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"layeh.com/radius/rfc2759"
+
+	"github.com/n0madic/go-ipsec/internal/secretmem"
 )
 
 // MSCHAPv2 opcodes (draft-kamath-pppext-eap-mschapv2 §2).
@@ -63,31 +65,46 @@ func (m *MSCHAPv2) HandleChallenge(req Packet) (Packet, error) {
 	}
 	m.peerChallenge = peerChal
 
-	username := []byte(m.Username)
-	ntResp, err := rfc2759.GenerateNTResponse(m.authChallenge, peerChal, username, []byte(m.Password))
-	if err != nil {
-		return Packet{}, fmt.Errorf("eap: NT-Response: %w", err)
-	}
-	m.ntResponse = ntResp
+	// Compute the password-derived material inside secretmem.Do: the stored
+	// NT-Response / password-hash-hash / expected AuthenticatorResponse (and
+	// the DES/MD4 intermediates rfc2759 allocates) are then runtime-tracked
+	// and erased once the EAP state is dropped after the handshake.
+	var cerr error
+	secretmem.Do(func() {
+		username := []byte(m.Username)
+		ntResp, err := rfc2759.GenerateNTResponse(m.authChallenge, peerChal, username, []byte(m.Password))
+		if err != nil {
+			cerr = fmt.Errorf("eap: NT-Response: %w", err)
+			return
+		}
+		m.ntResponse = ntResp
 
-	// password-hash-hash = NtPasswordHash(NtPasswordHash(unicode(password))).
-	ucs2, err := rfc2759.ToUTF16([]byte(m.Password))
-	if err != nil {
-		return Packet{}, err
-	}
-	m.passwordHashHash = rfc2759.NTPasswordHash(rfc2759.NTPasswordHash(ucs2))
+		// password-hash-hash = NtPasswordHash(NtPasswordHash(unicode(password))).
+		ucs2, err := rfc2759.ToUTF16([]byte(m.Password))
+		if err != nil {
+			cerr = err
+			return
+		}
+		m.passwordHashHash = rfc2759.NTPasswordHash(rfc2759.NTPasswordHash(ucs2))
 
-	// Pre-compute the AuthenticatorResponse we expect the server to send back.
-	authResp, err := rfc2759.GenerateAuthenticatorResponse(m.authChallenge, peerChal, ntResp, username, []byte(m.Password))
-	if err != nil {
-		return Packet{}, fmt.Errorf("eap: AuthenticatorResponse: %w", err)
+		// Pre-compute the AuthenticatorResponse we expect the server to send back.
+		authResp, err := rfc2759.GenerateAuthenticatorResponse(m.authChallenge, peerChal, ntResp, username, []byte(m.Password))
+		if err != nil {
+			cerr = fmt.Errorf("eap: AuthenticatorResponse: %w", err)
+			return
+		}
+		m.authResponse = authResp
+	})
+	if cerr != nil {
+		return Packet{}, cerr
 	}
-	m.authResponse = authResp
 
 	// Response value: PeerChallenge(16) | Reserved(8 zero) | NT-Response(24) | Flags(1).
+	// The NT-Response is wire data (it is sent to the server), so building the
+	// packet outside the secretmem.Do block above is fine.
 	value := make([]byte, responseValueLen)
 	copy(value[0:16], peerChal)
-	copy(value[24:48], ntResp)
+	copy(value[24:48], m.ntResponse)
 	// value[48] (Flags) stays 0.
 
 	// MSCHAPv2 Response type-data: OpCode | ID | MS-Length(2) | Value-Size | Value | Name.

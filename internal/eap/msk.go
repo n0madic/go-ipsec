@@ -4,6 +4,8 @@ import (
 	"errors"
 
 	"layeh.com/radius/rfc3079"
+
+	"github.com/n0madic/go-ipsec/internal/secretmem"
 )
 
 // MSKLen is the EAP Master Session Key length (RFC 3748 §7.10).
@@ -31,20 +33,32 @@ func DeriveMSK(passwordHashHash, ntResponse []byte) ([]byte, error) {
 	if len(passwordHashHash) == 0 || len(ntResponse) == 0 {
 		return nil, errors.New("eap: MSK derivation needs password-hash-hash and NT-Response")
 	}
-	master := rfc3079.GetMasterKey(passwordHashHash, ntResponse)
+	// Derive inside secretmem.Do: the MSK buffer (and the MPPE master-key
+	// intermediates) is then runtime-tracked and erased once dropped after
+	// the AUTH exchange (see internal/secretmem).
+	var msk []byte
+	var derr error
+	secretmem.Do(func() {
+		master := rfc3079.GetMasterKey(passwordHashHash, ntResponse)
 
-	recvKey, err := rfc3079.GetAsymmetricStartKey(master, rfc3079.KeyLength128Bit, false)
-	if err != nil {
-		return nil, err
-	}
-	sendKey, err := rfc3079.GetAsymmetricStartKey(master, rfc3079.KeyLength128Bit, true)
-	if err != nil {
-		return nil, err
-	}
+		recvKey, err := rfc3079.GetAsymmetricStartKey(master, rfc3079.KeyLength128Bit, false)
+		if err != nil {
+			derr = err
+			return
+		}
+		sendKey, err := rfc3079.GetAsymmetricStartKey(master, rfc3079.KeyLength128Bit, true)
+		if err != nil {
+			derr = err
+			return
+		}
 
-	msk := make([]byte, MSKLen)
-	copy(msk[0:16], recvKey)
-	copy(msk[16:32], sendKey)
-	// msk[32:64] stays zero.
+		msk = make([]byte, MSKLen)
+		copy(msk[0:16], recvKey)
+		copy(msk[16:32], sendKey)
+		// msk[32:64] stays zero.
+	})
+	if derr != nil {
+		return nil, derr
+	}
 	return msk, nil
 }

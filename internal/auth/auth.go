@@ -5,6 +5,8 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+
+	"github.com/n0madic/go-ipsec/internal/secretmem"
 )
 
 // keyPad is the constant string mixed into shared-secret AUTH (RFC 7296 §2.15).
@@ -44,9 +46,17 @@ func SignedOctets(prf PRF, realMessage, peerNonce, idPrime, macKey []byte) []byt
 // MSK (RFC 7296 §2.16 feeds the MSK into §2.15 as the shared secret):
 //
 //	AUTH = prf( prf(secret, "Key Pad for IKEv2"), SignedOctets )
+//
+// The computation runs inside secretmem.Do so the inner prf key (derived
+// directly from the PSK or MSK) is runtime-tracked and erased once dropped.
+// The returned AUTH value itself is wire data.
 func SharedSecretAuth(prf PRF, secret, signedOctets []byte) []byte {
-	inner := prf(secret, keyPad)
-	return prf(inner, signedOctets)
+	var out []byte
+	secretmem.Do(func() {
+		inner := prf(secret, keyPad)
+		out = prf(inner, signedOctets)
+	})
+	return out
 }
 
 // VerifyCertAuth verifies the responder's certificate-based AUTH payload

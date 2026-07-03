@@ -27,7 +27,7 @@ E2E_ENV = IPSEC_SERVER=$(IPSEC_SERVER) IPSEC_EAP_USER=$(IPSEC_EAP_USER) \
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build bin fmt fmt-check vet test test-race cover tidy \
+.PHONY: help build bin fmt fmt-check vet test test-race test-secret cover tidy \
         e2e e2e-up e2e-down e2e-test clean
 
 help: ## Show this help
@@ -64,6 +64,9 @@ test: ## Run the offline test suite
 
 test-race: ## Run the offline test suite under -race
 	$(GO) test -race -count=1 $(PKG)
+
+test-secret: ## Offline tests with the runtime/secret key-erasure experiment enabled
+	GOEXPERIMENT=runtimesecret $(GO) test -count=1 $(PKG)
 
 cover: ## Offline tests with a coverage summary
 	$(GO) test -count=1 -coverprofile=coverage.out $(PKG)

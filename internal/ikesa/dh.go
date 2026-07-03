@@ -16,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+
+	"github.com/n0madic/go-ipsec/internal/secretmem"
 )
 
 // DH group identifiers from the IANA "Transform Type 4 - Diffie-Hellman Group
@@ -78,8 +80,17 @@ type DH struct {
 	privX25519 *ecdh.PrivateKey // group 31 private key
 }
 
-// NewDH generates a fresh ephemeral key pair for the given DH group.
+// NewDH generates a fresh ephemeral key pair for the given DH group. Key
+// generation runs inside secretmem.Do so the private key (and its temporaries)
+// is runtime-tracked and erased once the DH is dropped after the exchange.
 func NewDH(group uint16) (*DH, error) {
+	var d *DH
+	var err error
+	secretmem.Do(func() { d, err = newDH(group) })
+	return d, err
+}
+
+func newDH(group uint16) (*DH, error) {
 	switch group {
 	case DHGroup14:
 		// rand.Int yields [0, p-2); shift into [2, p-2].
@@ -104,8 +115,17 @@ func NewDH(group uint16) (*DH, error) {
 // Shared computes the DH shared secret from the peer's public value, returned in
 // the canonical wire form for the group: g^(priv·peer) mod p left-padded to
 // modp2048Len bytes for group 14 (RFC 7296 §2.14), or the raw 32-byte Curve25519
-// output for group 31 (RFC 7748).
+// output for group 31 (RFC 7748). The computation runs inside secretmem.Do so
+// the shared secret (and the exponentiation temporaries) is runtime-tracked
+// and erased once dropped after key derivation.
 func (d *DH) Shared(peerPublic []byte) ([]byte, error) {
+	var shared []byte
+	var err error
+	secretmem.Do(func() { shared, err = d.shared(peerPublic) })
+	return shared, err
+}
+
+func (d *DH) shared(peerPublic []byte) ([]byte, error) {
 	switch d.Group {
 	case DHGroup14:
 		// A group-14 public is exactly the modulus length (RFC 7296 §2.14). Reject any
