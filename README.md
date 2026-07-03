@@ -245,17 +245,22 @@ IKE identities are built with the `Identity` constructors:
 ipsec.Email("user@example.com") // ID_RFC822_ADDR
 ipsec.FQDN("vpn.example.com")   // ID_FQDN
 ipsec.IPv4(netip.MustParseAddr("203.0.113.4")) // ID_IPV4_ADDR
+ipsec.IPv6(netip.MustParseAddr("2001:db8::4")) // ID_IPV6_ADDR
 ipsec.KeyID([]byte{0xde, 0xad})  // ID_KEY_ID
 ```
 
 The zero `Identity` is "unset". For `RemoteID` (IDr) that means "accept whatever
 the server presents", subject to certificate trust. With EAP-MSCHAPv2 the real
-client identity is the EAP username; `LocalID` is only a server-side policy
-selector and may be left unset (an empty IDi is sent).
+client identity is the EAP username; an unset `LocalID` defaults to an identity
+derived from it (`ID_RFC822_ADDR` when the username contains `@`, `ID_FQDN`
+otherwise).
 
 With **PSK** there is no EAP username, so `LocalID` (IDi) and `RemoteID` (IDr)
-carry the IKE identities directly. Many PSK gateways select the key by the IDi, so
-set `LocalID`; `RemoteID`, when set, is the IDr the server must present.
+carry the IKE identities directly. PSK gateways select the key by the IDi, so
+`LocalID` is required; `RemoteID`, when set, is the IDr the server must present.
+
+`IPv4`/`IPv6` fed a wrong-family or zero address return an invalid `Identity`
+that `Dial` rejects with a config-time error (never a deep handshake failure).
 
 ## DNS through the tunnel
 
@@ -382,6 +387,10 @@ capturing packets.
 - The **cipher suite is fixed** (see [Cipher suite](#cipher-suite)); there is no
   algorithm negotiation knob.
 - **Initiator only** — go-ipsec dials out; it is not an IKEv2 responder.
+- **No certificate revocation checking** — the server chain is verified for
+  trust, expiry, EKU, and SAN/identity match, but OCSP and CRLs are not
+  consulted (a common limitation among IKE clients). Pin a dedicated CA via
+  `RootCAs` to narrow the exposure.
 - Inner IPv6 delivery against mixed-family servers has a known strongSwan-side
   limitation; a v4-only server stays v4 transparently.
 

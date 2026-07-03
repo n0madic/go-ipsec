@@ -506,8 +506,10 @@ func (s *Session) detectSuspend(ctx context.Context, now time.Time) {
 		s.pending.fast = true
 		s.pending.nextRetransmit = now
 	default:
-		// A rekey is in flight; fast-fail it and arm a fast DPD for once the window
-		// frees (housekeeping fires it before re-occupying the window with a rekey).
+		// A rekey or DELETE is in flight; fast-fail it and arm a fast DPD for once
+		// the window frees (housekeeping fires it before re-occupying the window
+		// with a rekey). Fast-failing a DELETE ack is safe: the old Child SA is
+		// cleaned up by the grace timer regardless of how its ack times out.
 		s.pending.fast = true
 		s.pending.nextRetransmit = now
 		s.fastDPDDue = true

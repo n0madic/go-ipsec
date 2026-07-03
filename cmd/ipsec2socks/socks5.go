@@ -48,7 +48,16 @@ type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 type socksServer struct {
 	dial     dialFunc
 	resolver *net.Resolver
-	auth     string // "user:pass" or "" for no-auth
+	// authUser/authPass are the RFC 1929 credentials, split once from the
+	// user:password flag value so a password containing a colon compares as
+	// one field instead of re-splitting on every attempt; authOn gates the
+	// username/password method (the zero value serves unauthenticated).
+	authUser []byte
+	authPass []byte
+	authOn   bool
+	// maxConns caps concurrently served client connections (0 = unlimited);
+	// past the cap, accepted connections wait for a slot to free.
+	maxConns int
 	idle     time.Duration
 	log      *slog.Logger
 }
@@ -64,12 +73,21 @@ func (s *socksServer) serve(ctx context.Context, listen string) error {
 }
 
 func (s *socksServer) serveListener(ctx context.Context, ln net.Listener) error {
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		_ = ln.Close()
 	}()
 
+	// Bound concurrent handlers: an accepted connection waits for a free slot
+	// (the kernel backlog absorbs the burst) instead of spawning an unbounded
+	// goroutine per client — relevant on a non-loopback bind, where a flood
+	// would otherwise exhaust memory/FDs. handshakeTimeout guarantees stalled
+	// slots are reclaimed.
+	var sem chan struct{}
+	if s.maxConns > 0 {
+		sem = make(chan struct{}, s.maxConns)
+	}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -78,12 +96,27 @@ func (s *socksServer) serveListener(ctx context.Context, ln net.Listener) error 
 			}
 			return fmt.Errorf("socks accept: %w", err)
 		}
-		go s.handle(ctx, conn)
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				_ = conn.Close()
+				return nil
+			}
+		}
+		go func() {
+			defer func() {
+				if sem != nil {
+					<-sem
+				}
+			}()
+			s.handle(ctx, conn)
+		}()
 	}
 }
 
 func (s *socksServer) handle(ctx context.Context, client net.Conn) {
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	// Bound the negotiation phase so a stalled client can't hang the goroutine
 	// in io.ReadFull forever. Cleared before splicing, which has its own idle
 	// watchdog over the established connection.
@@ -104,10 +137,10 @@ func (s *socksServer) handle(ctx context.Context, client net.Conn) {
 	cancel()
 	if err != nil {
 		s.log.Debug("upstream dial failed", "target", target, "err", err)
-		writeReply(client, dialReplyCode(err))
+		_ = writeReply(client, dialReplyCode(err))
 		return
 	}
-	defer upstream.Close()
+	defer func() { _ = upstream.Close() }()
 
 	if err := writeReply(client, repSuccess); err != nil {
 		return
@@ -130,11 +163,11 @@ func (s *socksServer) negotiate(c net.Conn) error {
 	}
 
 	want := byte(methodNoAuth)
-	if s.auth != "" {
+	if s.authOn {
 		want = methodUserPass
 	}
 	if !slices.Contains(methods, want) {
-		c.Write([]byte{socksVersion, methodNoneOK})
+		_, _ = c.Write([]byte{socksVersion, methodNoneOK})
 		return errors.New("no acceptable auth method")
 	}
 	if _, err := c.Write([]byte{socksVersion, want}); err != nil {
@@ -166,14 +199,18 @@ func (s *socksServer) checkUserPass(c net.Conn) error {
 	if _, err := io.ReadFull(c, pass); err != nil {
 		return err
 	}
-	// Constant-time comparison so attempt latency does not leak the credential
-	// prefix length (subtle.ConstantTimeCompare returns 0 on a length mismatch).
-	cand := string(user) + ":" + string(pass)
-	if subtle.ConstantTimeCompare([]byte(cand), []byte(s.auth)) == 1 {
+	// Compare username and password as separate fields — concatenating them
+	// would let different wire splits of a colon-containing secret all
+	// authenticate. Both comparisons are constant-time and both always run,
+	// so attempt latency leaks neither which field mismatched nor a length
+	// (subtle.ConstantTimeCompare returns 0 on a length mismatch).
+	userOK := subtle.ConstantTimeCompare(user, s.authUser)
+	passOK := subtle.ConstantTimeCompare(pass, s.authPass)
+	if userOK&passOK == 1 {
 		_, err := c.Write([]byte{authVersion, 0x00})
 		return err
 	}
-	c.Write([]byte{authVersion, 0x01})
+	_, _ = c.Write([]byte{authVersion, 0x01})
 	return errors.New("bad credentials")
 }
 
@@ -188,7 +225,7 @@ func (s *socksServer) readRequest(ctx context.Context, c net.Conn) (string, erro
 		return "", errors.New("bad request version")
 	}
 	if hdr[1] != cmdConnect {
-		writeReply(c, repCommandNotSupport)
+		_ = writeReply(c, repCommandNotSupport)
 		return "", fmt.Errorf("unsupported command %d (only CONNECT)", hdr[1])
 	}
 
@@ -217,7 +254,7 @@ func (s *socksServer) readRequest(ctx context.Context, c net.Conn) (string, erro
 		}
 		domain = string(name)
 	default:
-		writeReply(c, repAddrNotSupport)
+		_ = writeReply(c, repAddrNotSupport)
 		return "", fmt.Errorf("unsupported address type %d", hdr[3])
 	}
 
@@ -241,7 +278,7 @@ func (s *socksServer) readRequest(ctx context.Context, c net.Conn) (string, erro
 		if err != nil {
 			// The ATYP (domain) IS supported; the name just did not resolve, so reply
 			// Host unreachable (0x04), not Address type not supported (0x08).
-			writeReply(c, repHostUnreach)
+			_ = writeReply(c, repHostUnreach)
 			return "", fmt.Errorf("resolve %q: %w", domain, err)
 		}
 		host = resolved
@@ -252,7 +289,7 @@ func (s *socksServer) readRequest(ctx context.Context, c net.Conn) (string, erro
 	// DNS-sinkholed domain) so the client gets an immediate "host unreachable"
 	// instead of a 30s dial timeout, and we skip a doomed netstack dial.
 	if isUnroutableTarget(host) {
-		writeReply(c, repHostUnreach)
+		_ = writeReply(c, repHostUnreach)
 		return "", fmt.Errorf("unroutable target %s", target)
 	}
 	return target, nil
@@ -303,7 +340,7 @@ func (s *socksServer) resolveHost(ctx context.Context, name string) (string, err
 // side hits the timeout.)
 func (s *socksServer) splice(client, upstream net.Conn) {
 	var once sync.Once
-	stop := func() { once.Do(func() { client.Close(); upstream.Close() }) }
+	stop := func() { once.Do(func() { _ = client.Close(); _ = upstream.Close() }) }
 	defer stop()
 
 	var lastNanos atomic.Int64

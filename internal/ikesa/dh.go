@@ -121,6 +121,10 @@ func (d *DH) Shared(peerPublic []byte) ([]byte, error) {
 		if peer.Cmp(big.NewInt(1)) <= 0 || peer.Cmp(modp2048PMinus2) > 0 {
 			return nil, errors.New("ikesa: peer DH public value out of range")
 		}
+		// big.Int.Exp does not document constant-time behaviour, so this is in
+		// principle a timing side channel on the private exponent. Accepted for
+		// the fallback group: the exponent is ephemeral (single handshake), and
+		// the preferred path is x25519 via crypto/ecdh, which is constant-time.
 		shared := new(big.Int).Exp(peer, d.privModp, modp2048P)
 		return leftPad(shared.Bytes(), modp2048Len), nil
 	case DHGroup31:

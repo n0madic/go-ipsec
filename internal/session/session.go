@@ -281,6 +281,13 @@ func saInitCookie(raw []byte) ([]byte, bool) {
 	}
 	for _, p := range m.Payloads {
 		if n, ok := p.(*ikemsg.NotifyPayload); ok && n.Type == ikemsg.NotifyCookie {
+			// RFC 7296 §2.6: cookie data MUST be 1..64 octets. Rejecting an
+			// out-of-range cookie (rather than echoing an attacker-sized blob
+			// back) also keeps the retry request comfortably below the marshal
+			// layer's uint16 length fields.
+			if len(n.Data) == 0 || len(n.Data) > 64 {
+				return nil, false
+			}
 			return n.Data, true
 		}
 	}

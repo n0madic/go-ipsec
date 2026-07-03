@@ -712,3 +712,20 @@ func TestParseTSBodyRejectsDegenerate(t *testing.T) {
 		t.Fatal("trailing bytes after selectors accepted")
 	}
 }
+
+// TestMarshalRejectsOversizedPayloadBody pins the chain-marshal guard: a body
+// that cannot fit the 16-bit generic-header length field must error instead of
+// silently wrapping the length and corrupting the outgoing message. This also
+// transitively bounds every nested length field (proposal, selector, config
+// attribute), each of which spans a subset of the payload body.
+func TestMarshalRejectsOversizedPayloadBody(t *testing.T) {
+	huge := &VendorIDPayload{Data: make([]byte, 0x10000)}
+	if _, _, err := (Payloads{huge}).Marshal(); err == nil {
+		t.Fatal("marshaled a payload body larger than the 16-bit length field")
+	}
+	// At the exact boundary (body + 4-byte header == 0xFFFF) it still fits.
+	max := &VendorIDPayload{Data: make([]byte, 0xFFFF-genericHeaderLen)}
+	if _, _, err := (Payloads{max}).Marshal(); err != nil {
+		t.Fatalf("boundary-size payload rejected: %v", err)
+	}
+}

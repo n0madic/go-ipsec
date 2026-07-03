@@ -59,11 +59,30 @@ func (u *udpConn) Send(ctx context.Context, p []byte) error {
 	if u.closed.Load() {
 		return ErrClosed
 	}
+	// Mirror Recv's discipline: the top-of-Send deadline set is authoritative
+	// (it also neutralises a leftover aLongTimeAgo from a prior Send's
+	// cancellation AfterFunc), and the AfterFunc interrupts a blocked write on
+	// plain cancellation. Without it a no-deadline driver send over a blocking
+	// transport (e.g. a custom PacketDialer under backpressure) could never
+	// observe shutdown: Close() waits for the workers before it closes the
+	// socket, and the worker would be stuck inside WriteTo forever.
 	if dl, ok := ctx.Deadline(); ok {
 		_ = u.pc.SetWriteDeadline(dl)
-		defer u.pc.SetWriteDeadline(zeroTime)
+	} else {
+		_ = u.pc.SetWriteDeadline(zeroTime)
 	}
+	stop := context.AfterFunc(ctx, func() { _ = u.pc.SetWriteDeadline(aLongTimeAgo) })
+	defer func() { _ = u.pc.SetWriteDeadline(zeroTime) }()
+	defer stop()
 	_, err := u.pc.WriteTo(p, u.remote.Load())
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if u.closed.Load() {
+			return ErrClosed
+		}
+	}
 	return err
 }
 
@@ -85,7 +104,7 @@ func (u *udpConn) Recv(ctx context.Context) ([]byte, error) {
 	// data-plane read at shutdown). The deferred clear keeps the common case tidy;
 	// the top-of-Recv reset above is what guarantees correctness against the race.
 	stop := context.AfterFunc(ctx, func() { _ = u.pc.SetReadDeadline(aLongTimeAgo) })
-	defer u.pc.SetReadDeadline(zeroTime)
+	defer func() { _ = u.pc.SetReadDeadline(zeroTime) }()
 	defer stop()
 	for {
 		n, src, err := u.pc.ReadFrom(u.rbuf)

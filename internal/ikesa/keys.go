@@ -16,8 +16,12 @@ const (
 	Responder
 )
 
-// keyPad is the constant string mixed into shared-secret AUTH (RFC 7296 §2.15).
-var keyPad = []byte("Key Pad for IKEv2")
+// minNonceLen is the RFC 7296 §2.10 floor: nonces must be at least 128 bits
+// and at least half the key size of the negotiated PRF (16 bytes for
+// PRF_HMAC_SHA2_256, the only PRF this client offers). A shorter peer nonce
+// weakens the freshness the nonces contribute to SKEYSEED and the AUTH signed
+// octets, so key derivation fails closed on it.
+const minNonceLen = 16
 
 // IKESA holds the derived IKE SA key material and the directional crypto state
 // for the SK{} envelope.
@@ -44,8 +48,8 @@ type IKESA struct {
 // nonceI/nonceR are the initiator/responder nonces, dhShared the MODP-2048
 // shared secret, and spii/spir the negotiated SPIs.
 func (s *IKESA) Derive(role Role, spii, spir uint64, nonceI, nonceR, dhShared []byte) error {
-	if len(nonceI) == 0 || len(nonceR) == 0 {
-		return errors.New("ikesa: empty nonce")
+	if len(nonceI) < minNonceLen || len(nonceR) < minNonceLen {
+		return errors.New("ikesa: nonce shorter than the RFC 7296 §2.10 minimum of 16 bytes")
 	}
 	if len(dhShared) == 0 {
 		return errors.New("ikesa: empty DH shared secret")
@@ -67,8 +71,11 @@ func DeriveRekeyIKE(oldSKd []byte, role Role, spii, spir uint64, nonceI, nonceR,
 	if len(oldSKd) == 0 {
 		return nil, errors.New("ikesa: empty old SK_d")
 	}
-	if len(nonceI) == 0 || len(nonceR) == 0 || len(dhShared) == 0 {
-		return nil, errors.New("ikesa: empty rekey input")
+	if len(nonceI) < minNonceLen || len(nonceR) < minNonceLen {
+		return nil, errors.New("ikesa: rekey nonce shorter than the RFC 7296 §2.10 minimum of 16 bytes")
+	}
+	if len(dhShared) == 0 {
+		return nil, errors.New("ikesa: empty rekey DH shared secret")
 	}
 	seed := make([]byte, 0, len(dhShared)+len(nonceI)+len(nonceR))
 	seed = append(seed, dhShared...)
@@ -211,16 +218,6 @@ func (s *IKESA) VerifyChecksum(msg []byte) bool {
 
 // PRF exposes the negotiated PRF for the AUTH machinery (signed octets).
 func (s *IKESA) PRF(key, data []byte) []byte { return prf(key, data) }
-
-// AuthMAC computes a shared-secret AUTH value per RFC 7296 §2.15:
-//
-//	AUTH = prf( prf(secret, "Key Pad for IKEv2"), signedOctets )
-//
-// For EAP methods that derive an MSK, secret is the 64-byte EAP-MSK.
-func (s *IKESA) AuthMAC(secret, signedOctets []byte) []byte {
-	inner := prf(secret, keyPad)
-	return prf(inner, signedOctets)
-}
 
 // ICVLen reports the integrity check value length of the negotiated suite.
 func (s *IKESA) ICVLen() int { return integICVLen }

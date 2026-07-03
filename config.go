@@ -3,6 +3,7 @@ package ipsec
 import (
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -11,7 +12,12 @@ import (
 
 // Default lifecycle parameters.
 const (
-	DefaultMTU              uint32        = 1400
+	DefaultMTU uint32 = 1400
+	// MinMTU is the floor for a non-zero MTU. go-tun2net only clamps an
+	// oversized MTU down, so a pathologically small value (fat-fingered "14"
+	// for 1400) would otherwise reach the netstack and break it; 576 is the
+	// classic IPv4 minimum reassembly size.
+	MinMTU                  uint32        = 576
 	DefaultKeepAlive        time.Duration = 20 * time.Second
 	DefaultDPDTimeout       time.Duration = 30 * time.Second
 	DefaultRekeyLifetime    time.Duration = time.Hour
@@ -48,7 +54,9 @@ type Config struct {
 	Server string
 
 	// LocalID / RemoteID are the IKE identities. RemoteID, when set, is also
-	// matched against the server certificate SANs.
+	// matched against the server certificate SANs. With EAP an unset LocalID
+	// defaults to an identity derived from EAP.Username; with PSK LocalID is
+	// required.
 	LocalID  Identity
 	RemoteID Identity
 
@@ -167,6 +175,22 @@ func (c *Config) validate() error {
 			return errors.New("ipsec: Config.EAP.Password is required")
 		}
 	}
+	// Identities: LocalID is marshalled into the wire IDi, so an unset or
+	// malformed value would otherwise surface as an opaque AUTHENTICATION_FAILED
+	// deep in IKE_AUTH. With EAP an unset LocalID defaults to the EAP username;
+	// with PSK the identity keys the peer's PSK lookup and must be explicit.
+	if c.LocalID.IsZero() {
+		if hasPSK {
+			return errors.New("ipsec: Config.LocalID is required with PSK authentication")
+		}
+		c.LocalID = defaultEAPIdentity(c.EAP.Username)
+	}
+	if err := c.LocalID.check(); err != nil {
+		return fmt.Errorf("ipsec: Config.LocalID: %w", err)
+	}
+	if err := c.RemoteID.check(); err != nil {
+		return fmt.Errorf("ipsec: Config.RemoteID: %w", err)
+	}
 	if c.MTU == 0 {
 		c.MTU = DefaultMTU
 	}
@@ -214,5 +238,54 @@ func (c *Config) validate() error {
 			"configured", c.RekeyMaxPackets, "floor", MinRekeyMaxPackets)
 		c.RekeyMaxPackets = MinRekeyMaxPackets
 	}
+	// Floor a tiny MTU: go-tun2net only clamps oversized values down, so a
+	// pathological hint would otherwise reach the netstack unchanged.
+	if c.MTU < MinMTU {
+		c.Logger.Warn("ipsec: MTU below floor, raising it",
+			"configured", c.MTU, "floor", MinMTU)
+		c.MTU = MinMTU
+	}
 	return nil
+}
+
+// redactSecret renders a credential for display without leaking its value or
+// length.
+func redactSecret(s string) string {
+	if s == "" {
+		return "<unset>"
+	}
+	return "<redacted>"
+}
+
+// String implements fmt.Stringer. It replaces the default struct rendering so
+// a Config printed with %v/%+v (a tempting debug one-liner in consumer code)
+// cannot leak the PSK or the EAP password.
+func (c Config) String() string {
+	return fmt.Sprintf("ipsec.Config{Server: %q, LocalID: %v, RemoteID: %v, EAP: %v, PSK: %s, MTU: %d}",
+		c.Server, c.LocalID, c.RemoteID, c.EAP, redactSecret(c.PSK), c.MTU)
+}
+
+// LogValue implements slog.LogValuer with the same credential redaction for
+// structured logging (slog.Any("config", cfg)).
+func (c Config) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("server", c.Server),
+		slog.String("localID", c.LocalID.String()),
+		slog.String("remoteID", c.RemoteID.String()),
+		slog.String("eapUser", c.EAP.Username),
+		slog.String("psk", redactSecret(c.PSK)),
+	)
+}
+
+// String implements fmt.Stringer, redacting the password.
+func (e EAPMSCHAPv2) String() string {
+	return fmt.Sprintf("ipsec.EAPMSCHAPv2{Username: %q, Password: %s}", e.Username, redactSecret(e.Password))
+}
+
+// LogValue implements slog.LogValuer, redacting the password.
+func (e EAPMSCHAPv2) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("username", e.Username),
+		slog.String("password", redactSecret(e.Password)),
+	)
 }

@@ -38,6 +38,7 @@ type cliOpts struct {
 	listen    string
 	socksAuth string
 	dns       string
+	maxConns  int
 	idle      time.Duration
 	timeout   time.Duration
 	rekey     time.Duration
@@ -59,6 +60,7 @@ func parseFlags() *cliOpts {
 	flag.StringVar(&o.listen, "listen", "127.0.0.1:1080", "SOCKS5 listen address")
 	flag.StringVar(&o.socksAuth, "socks-auth", "", "optional SOCKS5 username:password (RFC 1929)")
 	flag.StringVar(&o.dns, "dns", "", "override DNS server for in-tunnel resolution (IP or IP:53)")
+	flag.IntVar(&o.maxConns, "max-conns", 1024, "maximum concurrent proxied connections (0 = unlimited)")
 	flag.DurationVar(&o.idle, "idle", 10*time.Minute, "close idle proxied TCP after this duration (0 disables)")
 	flag.DurationVar(&o.timeout, "timeout", 45*time.Second, "IKE handshake timeout")
 	flag.DurationVar(&o.rekey, "rekey", 0, "Child SA soft lifetime (0 = library default 1h); low values force client-initiated rekey for testing")
@@ -98,7 +100,19 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	case hasEAP && (opts.eapUser == "" || opts.eapPass == ""):
 		return errors.New("-eap-user and -eap-pass are both required for EAP-MSCHAPv2 auth")
 	}
-	if err := checkLoopbackBind(opts.listen, opts.insecure); err != nil {
+	if opts.timeout <= 0 {
+		return errors.New("-timeout must be positive")
+	}
+	if opts.idle < 0 {
+		return errors.New("-idle must be >= 0 (0 disables the idle timeout)")
+	}
+	if opts.maxConns < 0 {
+		return errors.New("-max-conns must be >= 0 (0 = unlimited)")
+	}
+	if opts.socksAuth != "" && !strings.Contains(opts.socksAuth, ":") {
+		return errors.New(`-socks-auth must be "user:password"`)
+	}
+	if err := checkLoopbackBind(opts.listen, opts.insecure, opts.socksAuth != ""); err != nil {
 		return err
 	}
 
@@ -160,7 +174,7 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("ipsec dial: %w", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	logger.Info("tunnel up", "localIP", client.LocalIP(), "localIP6", client.LocalIP6(), "dns", client.DNS())
 
 	resolver, err := buildResolver(client, opts.dns)
@@ -171,21 +185,30 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	srv := &socksServer{
 		dial:     client.DialContext,
 		resolver: resolver,
-		auth:     opts.socksAuth,
+		maxConns: opts.maxConns,
 		idle:     opts.idle,
 		log:      logger,
+	}
+	if opts.socksAuth != "" {
+		user, pass, _ := strings.Cut(opts.socksAuth, ":")
+		srv.authUser, srv.authPass, srv.authOn = []byte(user), []byte(pass), true
 	}
 	return srv.serve(rootCtx, opts.listen)
 }
 
 // parseIdentity infers an IKE identity kind from a string: "@"→email,
-// parseable IP→IPv4, otherwise FQDN.
+// parseable IP→IPv4/IPv6, otherwise FQDN. An IPv6 literal must become an IP
+// identity, not an FQDN — a DNS-type IDr would never match the server
+// certificate's IP SAN and a legitimate server would be rejected.
 func parseIdentity(s string) ipsec.Identity {
 	if strings.Contains(s, "@") {
 		return ipsec.Email(s)
 	}
-	if a, err := netip.ParseAddr(s); err == nil && a.Is4() {
-		return ipsec.IPv4(a)
+	if a, err := netip.ParseAddr(s); err == nil {
+		if a.Unmap().Is4() {
+			return ipsec.IPv4(a)
+		}
+		return ipsec.IPv6(a)
 	}
 	return ipsec.FQDN(s)
 }
@@ -204,25 +227,26 @@ func loadCAPool(path string) (*x509.CertPool, error) {
 }
 
 // checkLoopbackBind rejects a non-loopback listen address unless explicitly
-// allowed, so the open proxy is not accidentally exposed to the network.
-func checkLoopbackBind(listen string, allow bool) error {
-	if allow {
-		return nil
-	}
+// allowed, and even then requires SOCKS auth — an open, unauthenticated relay
+// onto the VPN network is never a sane configuration, and the flag name only
+// signals "non-loopback bind", not "and also unauthenticated".
+func checkLoopbackBind(listen string, allow, hasAuth bool) error {
 	host, _, err := net.SplitHostPort(listen)
 	if err != nil {
 		return fmt.Errorf("bad -listen %q: %w", listen, err)
 	}
-	ip, err := netip.ParseAddr(host)
-	if err != nil {
-		// Hostname — require it to be localhost.
-		if host == "localhost" {
-			return nil
-		}
+	loopback := host == "localhost" // hostname form: require localhost
+	if ip, perr := netip.ParseAddr(host); perr == nil {
+		loopback = ip.IsLoopback()
+	}
+	if loopback {
+		return nil
+	}
+	if !allow {
 		return fmt.Errorf("-listen %q is not loopback; pass -insecure-allow-public-bind to override", listen)
 	}
-	if !ip.IsLoopback() {
-		return fmt.Errorf("-listen %q is not loopback; pass -insecure-allow-public-bind to override", listen)
+	if !hasAuth {
+		return fmt.Errorf("-listen %q is not loopback and no -socks-auth is set; refusing to expose an unauthenticated proxy", listen)
 	}
 	return nil
 }

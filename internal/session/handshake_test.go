@@ -1378,3 +1378,31 @@ func makeTestCert(t *testing.T, dns string) (*x509.Certificate, *rsa.PrivateKey,
 	roots.AddCert(ca)
 	return leaf, leafKey, roots
 }
+
+// TestSAInitCookieBounds: RFC 7296 §2.6 caps COOKIE notification data at 64
+// octets. An oversized (or empty) cookie from the responder is ignored rather
+// than echoed back verbatim into our retry request.
+func TestSAInitCookieBounds(t *testing.T) {
+	build := func(cookie []byte) []byte {
+		m := &ikemsg.Message{
+			InitiatorSPI: 1, ResponderSPI: 2,
+			Exchange: ikemsg.ExchangeIKESAInit,
+			Flags:    ikemsg.FlagResponse,
+			Payloads: ikemsg.Payloads{&ikemsg.NotifyPayload{Type: ikemsg.NotifyCookie, Data: cookie}},
+		}
+		raw, err := m.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	if c, ok := saInitCookie(build(bytes.Repeat([]byte{0xAB}, 64))); !ok || len(c) != 64 {
+		t.Fatal("a valid 64-byte cookie was rejected")
+	}
+	if _, ok := saInitCookie(build(bytes.Repeat([]byte{0xAB}, 65))); ok {
+		t.Fatal("a 65-byte cookie (over the RFC 7296 §2.6 cap) was accepted")
+	}
+	if _, ok := saInitCookie(build(nil)); ok {
+		t.Fatal("an empty cookie was accepted")
+	}
+}

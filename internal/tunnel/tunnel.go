@@ -124,6 +124,13 @@ type espConn struct {
 	sa   atomicSA
 	send SendFunc
 
+	// sendCtx is canceled by Close so a Write blocked inside the transport
+	// send (e.g. a custom PacketDialer under backpressure) is interrupted
+	// instead of outliving the conn — Close is only checked at Write entry,
+	// so without this a blocked send would never observe it.
+	sendCtx    context.Context
+	sendCancel context.CancelFunc
+
 	mu           sync.Mutex
 	readDeadline time.Time
 	wake         chan struct{}
@@ -134,6 +141,7 @@ type espConn struct {
 
 func newESPConn(sa *esp.SA, send SendFunc) *espConn {
 	c := &espConn{send: send, closed: make(chan struct{}), wake: make(chan struct{}, 1)}
+	c.sendCtx, c.sendCancel = context.WithCancel(context.Background())
 	c.sa.store(sa)
 	return c
 }
@@ -153,7 +161,12 @@ func (c *espConn) Write(p []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := c.send(context.Background(), pkt); err != nil {
+	if err := c.send(c.sendCtx, pkt); err != nil {
+		select {
+		case <-c.closed:
+			return 0, net.ErrClosed
+		default:
+		}
 		return 0, err
 	}
 	return len(p), nil
@@ -196,7 +209,10 @@ func (c *espConn) Read(p []byte) (int, error) {
 }
 
 func (c *espConn) Close() error {
-	c.closeOnce.Do(func() { close(c.closed) })
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		c.sendCancel()
+	})
 	return nil
 }
 

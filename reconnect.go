@@ -2,6 +2,8 @@ package ipsec
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"time"
 
@@ -137,11 +139,26 @@ func (c *Client) redialWithBackoff() (*session.Session, error) {
 			return nil, errClientClosing
 		}
 		c.cfg.Logger.Warn("reconnect attempt failed", "attempt", attempt, "backoff", backoff, "err", err)
-		if !c.sleep(backoff) {
+		// Jitter each wait so a fleet of clients knocked out by a shared cause
+		// (server restart, upstream blip) does not redial in lockstep against a
+		// server that just came back — the same de-synchronisation the rekey
+		// timers apply via jitteredDeadline in internal/session.
+		if !c.sleep(jitterDuration(backoff)) {
 			return nil, errClientClosing
 		}
 		backoff = min(backoff*2, c.cfg.ReconnectBackoffMax)
 	}
+}
+
+// jitterDuration scales d by a random 0.85–1.0 factor (crypto/rand; falls back
+// to the midpoint if the read fails).
+func jitterDuration(d time.Duration) time.Duration {
+	var b [2]byte
+	frac := 0.5
+	if _, err := rand.Read(b[:]); err == nil {
+		frac = float64(binary.BigEndian.Uint16(b[:])) / 65536.0
+	}
+	return time.Duration(float64(d) * (0.85 + 0.15*frac))
 }
 
 // sleep waits for d or until superCtx is cancelled. It returns false if the

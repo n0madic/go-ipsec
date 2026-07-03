@@ -233,6 +233,15 @@ func (s *Session) completeChildRekey(ctx context.Context, inner ikemsg.Payloads,
 	})
 	s.child = &ChildSA{InitiatorSPI: p.child.newInSPI, ResponderSPI: respSPI, Keys: keys}
 	s.childInstalledAt = time.Now()
+	// A peer DELETE of the SA this rekey just replaced may have queued a
+	// re-establishment while the exchange was in flight (window size 1). The
+	// fresh SA installed above makes that queued attempt stale — running it
+	// would discard the new SA for a redundant third generation — so drop it.
+	// Failure paths return before this point and keep the flag set: if the
+	// peer instead rejected the rekey (it already DELETEd the old SA), the
+	// queued re-establishment is the recovery.
+	s.childReestablish = false
+	s.nextChildReestablish = time.Time{}
 	if p.child.reestablish {
 		return nil // the peer already DELETEd the old SA; nothing to DELETE
 	}

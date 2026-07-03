@@ -1,0 +1,10 @@
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      # Tests close sockets/listeners best-effort in defers and t.Cleanup;
+      # unchecked Close/SetDeadline there is deliberate, not a defect.
+      - path: _test\.go
+        linters:
+          - errcheck

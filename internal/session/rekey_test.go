@@ -1543,3 +1543,78 @@ func beUint32(b []byte) uint32 {
 	}
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
+
+// TestRekeyCompletionClearsQueuedReestablish: a peer DELETE of the live Child
+// SA that lands while our own (non-reestablish) rekey of that same SA is in
+// flight (window size 1) queues a re-establishment. The rekey then completing
+// successfully installs a fresh SA, which must drop the queued flag —
+// otherwise housekeeping would discard the just-installed SA for a redundant
+// third generation. Failure paths keep the flag: if the peer instead rejects
+// the rekey, the queued re-establishment is the recovery.
+func TestRekeyCompletionClearsQueuedReestablish(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+	initConn := initS.conn
+	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	respS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	initS.SetDataPlane(&fakeDataPlane{})
+	respS.SetDataPlane(&fakeDataPlane{})
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+
+	// Our own rekey of the live SA goes in flight.
+	if err := initS.initiateChildRekey(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// The peer's DELETE for the same SA races in before the rekey response;
+	// the busy window queues a re-establishment.
+	del := ikemsg.Payloads{&ikemsg.DeletePayload{Protocol: ikemsg.ProtocolESP, SPIs: [][]byte{{0, 0, 0x22, 0x22}}}}
+	delRaw, err := encodeSKWith(respS.ikeSA, respS.initiatorSPI, respS.responderSPI,
+		ikemsg.ExchangeInformational, 0, 9, del)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exit := initS.handleInbound(ctx, delRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if !initS.childReestablish {
+		t.Fatal("busy window did not queue the re-establishment")
+	}
+
+	// Responder answers our rekey request (drain the rekey request first, the
+	// DELETE ack second).
+	reqRaw, err := respConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := respConn.Recv(ctx); err != nil { // DELETE ack
+		t.Fatal(err)
+	}
+	hdr, inner, dec, err := respS.decodeIKE(reqRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := respS.handleChildRekeyRequest(ctx, hdr, inner, dec, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initiator completes the rekey: a fresh SA is installed and the queued
+	// re-establishment is now stale.
+	respRaw, err := initConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exit := initS.handleInbound(ctx, respRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if initS.child == nil || initS.child.ResponderSPI == 0x2222 {
+		t.Fatal("rekey did not install a fresh SA")
+	}
+	if initS.childReestablish {
+		t.Fatal("queued re-establishment not dropped after the rekey installed a fresh SA")
+	}
+	if !initS.nextChildReestablish.IsZero() {
+		t.Fatal("stale re-establishment backoff survived rekey completion")
+	}
+}

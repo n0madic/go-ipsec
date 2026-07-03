@@ -74,7 +74,18 @@ func (c *Client) startWorkers(sess *session.Session) {
 
 	onDead := c.signalDeath
 	if !c.cfg.autoReconnectEnabled() {
-		onDead = func() { go c.Close() }
+		// Close must run off the driver goroutine (its mgr.Wait would deadlock
+		// waiting on the very goroutine invoking onDead). Log the teardown and
+		// any error: with auto-reconnect off this is the only trace of a dead
+		// peer — the caller otherwise just starts seeing net.ErrClosed.
+		onDead = func() {
+			go func() {
+				c.cfg.Logger.Warn("IKE SA declared dead, tearing the client down (auto-reconnect disabled)")
+				if err := c.Close(); err != nil {
+					c.cfg.Logger.Warn("teardown after peer death failed", "err", err)
+				}
+			}()
+		}
 	}
 	// A worker panic is recovered by the manager, which would otherwise only cancel
 	// this generation's context — leaving deathSig empty so the supervisor never
@@ -85,10 +96,19 @@ func (c *Client) startWorkers(sess *session.Session) {
 	c.mu.Lock()
 	c.mgr = mgr
 	c.mu.Unlock()
-	mgr.Go("rx-demux", func(ctx context.Context) { c.rxDemux(ctx, inbox) })
-	mgr.Go("ike-driver", func(ctx context.Context) { sess.Driver(ctx, inbox, onDead) })
+	// Go returns false only on a manager that has already been shut down —
+	// unreachable today (Close waits out the supervisor before touching the
+	// manager), but a silently rejected worker would leave the tunnel
+	// half-started with no diagnostic if that invariant ever breaks.
+	start := func(name string, fn func(context.Context)) {
+		if !mgr.Go(name, fn) {
+			c.cfg.Logger.Error("worker rejected by a shut-down manager", "worker", name)
+		}
+	}
+	start("rx-demux", func(ctx context.Context) { c.rxDemux(ctx, inbox) })
+	start("ike-driver", func(ctx context.Context) { sess.Driver(ctx, inbox, onDead) })
 	if c.cfg.KeepAlive > 0 {
-		mgr.Go("nat-keepalive", c.keepaliveLoop)
+		start("nat-keepalive", c.keepaliveLoop)
 	}
 }
 

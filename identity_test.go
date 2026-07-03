@@ -19,6 +19,7 @@ func TestIdentityRoundTrip(t *testing.T) {
 		{"email", Email("user@example.com")},
 		{"keyid", KeyID([]byte{0x01, 0x02, 0x03, 0xFF})},
 		{"ipv4", IPv4(netip.MustParseAddr("10.1.2.3"))},
+		{"ipv6", IPv6(netip.MustParseAddr("2001:db8::42"))},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -54,9 +55,10 @@ func TestIdentityRoundTrip(t *testing.T) {
 	}
 }
 
-// TestIPv4ConstructorGuards is finding #5: ipsec.IPv4 must not panic on a
-// non-IPv4 or zero addr; it returns the unset Identity (which validate rejects).
-func TestIPv4ConstructorGuards(t *testing.T) {
+// TestIPConstructorGuards: ipsec.IPv4/IPv6 must not panic on a wrong-family or
+// zero addr; they return an invalid Identity — distinguishable from the unset
+// zero value — that Identity.check (and therefore Config.validate) rejects.
+func TestIPConstructorGuards(t *testing.T) {
 	if id := IPv4(netip.MustParseAddr("192.0.2.7")); id.Kind != IDKindIPv4 || !bytes.Equal(id.Data, []byte{192, 0, 2, 7}) {
 		t.Fatalf("valid IPv4 mishandled: %+v", id)
 	}
@@ -64,9 +66,25 @@ func TestIPv4ConstructorGuards(t *testing.T) {
 	if id := IPv4(netip.MustParseAddr("::ffff:192.0.2.8")); id.Kind != IDKindIPv4 || !bytes.Equal(id.Data, []byte{192, 0, 2, 8}) {
 		t.Fatalf("4-in-6 IPv4 mishandled: %+v", id)
 	}
-	for _, addr := range []netip.Addr{netip.MustParseAddr("2001:db8::1"), {}} {
-		if id := IPv4(addr); !id.IsZero() {
-			t.Fatalf("IPv4(%v) should be the unset Identity, got %+v", addr, id)
+	if id := IPv6(netip.MustParseAddr("2001:db8::1")); id.Kind != IDKindIPv6 || len(id.Data) != 16 {
+		t.Fatalf("valid IPv6 mishandled: %+v", id)
+	}
+	bad := []Identity{
+		IPv4(netip.MustParseAddr("2001:db8::1")),
+		IPv4(netip.Addr{}),
+		IPv6(netip.MustParseAddr("192.0.2.1")),
+		IPv6(netip.MustParseAddr("::ffff:192.0.2.8")), // 4-mapped is not a v6 identity
+		IPv6(netip.Addr{}),
+	}
+	for i, id := range bad {
+		if id.IsZero() {
+			t.Fatalf("case %d: invalid identity is indistinguishable from unset", i)
+		}
+		if err := id.check(); err == nil {
+			t.Fatalf("case %d: invalid identity passed check()", i)
+		}
+		if id.String() != "<invalid>" {
+			t.Fatalf("case %d: String() = %q, want <invalid>", i, id.String())
 		}
 	}
 }

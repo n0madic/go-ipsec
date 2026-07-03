@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	ipsec "github.com/n0madic/go-ipsec"
 )
 
 // TestDialReplyCode is finding #22: an upstream dial timeout maps to Host
@@ -328,18 +330,86 @@ func TestCheckLoopbackBind(t *testing.T) {
 	for _, tc := range []struct {
 		addr    string
 		allow   bool
+		hasAuth bool
 		wantErr bool
 	}{
-		{"127.0.0.1:1080", false, false},
-		{"localhost:1080", false, false},
-		{"0.0.0.0:1080", false, true},
-		{"192.168.1.5:1080", false, true},
-		{"0.0.0.0:1080", true, false},
+		{"127.0.0.1:1080", false, false, false},
+		{"localhost:1080", false, false, false},
+		{"0.0.0.0:1080", false, false, true},
+		{"192.168.1.5:1080", false, false, true},
+		// A public bind additionally requires SOCKS auth: the override flag
+		// only signals "non-loopback", not "and also unauthenticated".
+		{"0.0.0.0:1080", true, false, true},
+		{"0.0.0.0:1080", true, true, false},
+		{"192.168.1.5:1080", true, true, false},
+		// Loopback never needs auth, with or without the override.
+		{"127.0.0.1:1080", true, false, false},
 	} {
-		err := checkLoopbackBind(tc.addr, tc.allow)
+		err := checkLoopbackBind(tc.addr, tc.allow, tc.hasAuth)
 		if (err != nil) != tc.wantErr {
-			t.Errorf("checkLoopbackBind(%q, %v) err=%v, wantErr=%v", tc.addr, tc.allow, err, tc.wantErr)
+			t.Errorf("checkLoopbackBind(%q, allow=%v, auth=%v) err=%v, wantErr=%v", tc.addr, tc.allow, tc.hasAuth, err, tc.wantErr)
 		}
+	}
+}
+
+// TestParseIdentityKinds: the CLI identity heuristic must classify an IPv6
+// literal as an IP identity, not an FQDN — a DNS-type IDr never matches a
+// certificate's IP SAN.
+func TestParseIdentityKinds(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want ipsec.IDKind
+	}{
+		{"user@example.com", ipsec.IDKindEmail},
+		{"192.0.2.7", ipsec.IDKindIPv4},
+		{"2001:db8::1", ipsec.IDKindIPv6},
+		{"::ffff:192.0.2.8", ipsec.IDKindIPv4}, // 4-mapped stays an IPv4 identity
+		{"vpn.example.com", ipsec.IDKindFQDN},
+	} {
+		if got := parseIdentity(tc.in).Kind; got != tc.want {
+			t.Errorf("parseIdentity(%q).Kind = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestCheckUserPassSplit: credentials are compared as separate user/password
+// fields, so a password containing a colon does not let alternative wire
+// splits of the same concatenation authenticate.
+func TestCheckUserPassSplit(t *testing.T) {
+	srv := &socksServer{
+		authUser: []byte("alice"),
+		authPass: []byte("se:cret"),
+		authOn:   true,
+		log:      slog.New(slog.DiscardHandler),
+	}
+	authAttempt := func(user, pass string) error {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		errCh := make(chan error, 1)
+		go func() { errCh <- srv.checkUserPass(server) }()
+		req := []byte{authVersion, byte(len(user))}
+		req = append(req, user...)
+		req = append(req, byte(len(pass)))
+		req = append(req, pass...)
+		if _, err := client.Write(req); err != nil {
+			t.Fatal(err)
+		}
+		resp := make([]byte, 2)
+		if _, err := io.ReadFull(client, resp); err != nil {
+			t.Fatal(err)
+		}
+		return <-errCh
+	}
+	if err := authAttempt("alice", "se:cret"); err != nil {
+		t.Fatalf("correct credentials rejected: %v", err)
+	}
+	// The same concatenation "alice:se:cret" split differently must fail.
+	if err := authAttempt("alice:se", "cret"); err == nil {
+		t.Fatal("alternative split of the concatenated secret authenticated")
+	}
+	if err := authAttempt("alice", "wrong"); err == nil {
+		t.Fatal("wrong password authenticated")
 	}
 }
 

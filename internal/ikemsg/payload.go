@@ -1,6 +1,9 @@
 package ikemsg
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // Payload is one IKE payload. The body methods are unexported: every concrete
 // payload lives in this package, and callers construct them as struct literals and
@@ -39,6 +42,15 @@ func (ps Payloads) Marshal() (first PayloadType, body []byte, err error) {
 		payloadBody, err := p.marshalBody()
 		if err != nil {
 			return PayloadNone, nil, err
+		}
+		// The generic-header length is a 16-bit field; a bare uint16 cast
+		// below would silently wrap on an oversized body and corrupt the
+		// outgoing message. No legitimate payload approaches the limit (a
+		// whole datagram is ≤65535 bytes), so fail loudly instead. This also
+		// transitively bounds every nested length field (proposal, transform,
+		// selector, config attribute): each spans a subset of this body.
+		if len(payloadBody) > 0xFFFF-genericHeaderLen {
+			return PayloadNone, nil, fmt.Errorf("ikemsg: payload type %d body of %d bytes exceeds the 16-bit length field", p.PayloadType(), len(payloadBody))
 		}
 
 		var nextType PayloadType

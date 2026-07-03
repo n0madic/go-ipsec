@@ -1,6 +1,11 @@
 package ipsec
 
 import (
+	"bytes"
+	"fmt"
+	"log/slog"
+	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,7 +54,7 @@ func TestConfigValidateRequiresCredentials(t *testing.T) {
 // validates (no EAP, no RootCAs needed), supplying both PSK and EAP is rejected as
 // ambiguous, and supplying neither is rejected.
 func TestConfigValidatePSK(t *testing.T) {
-	pskOnly := Config{Server: "vpn.example.com:500", PSK: "sharedsecret"}
+	pskOnly := Config{Server: "vpn.example.com:500", PSK: "sharedsecret", LocalID: FQDN("client.test")}
 	if err := pskOnly.validate(); err != nil {
 		t.Fatalf("PSK-only config rejected: %v", err)
 	}
@@ -70,6 +75,71 @@ func TestConfigValidatePSK(t *testing.T) {
 	if err := neither.validate(); err == nil {
 		t.Fatal("config with neither PSK nor EAP accepted")
 	}
+}
+
+// TestConfigValidateIdentities: validate() enforces the identity contract that
+// identity.go documents — PSK requires an explicit LocalID, EAP defaults an
+// unset LocalID from the username, and an invalid identity (a constructor fed
+// bad input, or hand-built malformed data) is rejected at config time instead
+// of surfacing as an opaque AUTHENTICATION_FAILED deep in IKE_AUTH.
+func TestConfigValidateIdentities(t *testing.T) {
+	t.Run("psk requires LocalID", func(t *testing.T) {
+		c := Config{Server: "vpn:500", PSK: "s"}
+		if err := c.validate(); err == nil {
+			t.Fatal("PSK config without LocalID accepted")
+		}
+	})
+	t.Run("eap defaults LocalID from username", func(t *testing.T) {
+		email := Config{Server: "vpn:500", EAP: EAPMSCHAPv2{Username: "user@corp.test", Password: "p"}}
+		if err := email.validate(); err != nil {
+			t.Fatal(err)
+		}
+		if email.LocalID.Kind != IDKindEmail || string(email.LocalID.Data) != "user@corp.test" {
+			t.Fatalf("LocalID = %v, want email identity", email.LocalID)
+		}
+		plain := Config{Server: "vpn:500", EAP: EAPMSCHAPv2{Username: "user1", Password: "p"}}
+		if err := plain.validate(); err != nil {
+			t.Fatal(err)
+		}
+		if plain.LocalID.Kind != IDKindFQDN || string(plain.LocalID.Data) != "user1" {
+			t.Fatalf("LocalID = %v, want FQDN identity", plain.LocalID)
+		}
+	})
+	t.Run("invalid constructor output rejected", func(t *testing.T) {
+		c := Config{
+			Server:  "vpn:500",
+			PSK:     "s",
+			LocalID: IPv4(netip.MustParseAddr("2001:db8::1")), // collapses to invalid
+		}
+		if err := c.validate(); err == nil {
+			t.Fatal("invalid LocalID accepted")
+		}
+	})
+	t.Run("malformed hand-built identity rejected", func(t *testing.T) {
+		c := Config{
+			Server:  "vpn:500",
+			PSK:     "s",
+			LocalID: Identity{Kind: IDKindIPv4, Data: []byte{1, 2}},
+		}
+		if err := c.validate(); err == nil {
+			t.Fatal("malformed IPv4 LocalID accepted")
+		}
+	})
+	t.Run("RemoteID optional but must be well-formed", func(t *testing.T) {
+		ok := Config{Server: "vpn:500", PSK: "s", LocalID: FQDN("c")}
+		if err := ok.validate(); err != nil {
+			t.Fatalf("unset RemoteID rejected: %v", err)
+		}
+		bad := Config{
+			Server:   "vpn:500",
+			PSK:      "s",
+			LocalID:  FQDN("c"),
+			RemoteID: IPv6(netip.MustParseAddr("192.0.2.1")), // collapses to invalid
+		}
+		if err := bad.validate(); err == nil {
+			t.Fatal("invalid RemoteID accepted")
+		}
+	})
 }
 
 // TestConfigValidateFloorsRekeyMaxPackets is finding #6: a tiny non-zero
@@ -188,5 +258,69 @@ func TestConfigValidateClampsReplayWindow(t *testing.T) {
 	}
 	if c.ReplayWindow != esp.MaxReplayWindow {
 		t.Fatalf("ReplayWindow = %d, want clamped to %d", c.ReplayWindow, esp.MaxReplayWindow)
+	}
+}
+
+// TestConfigRedactsSecrets: a Config (or EAPMSCHAPv2) rendered through fmt or
+// slog must never leak the PSK or the EAP password — %+v on a struct and
+// slog.Any are tempting debug one-liners in consumer code.
+func TestConfigRedactsSecrets(t *testing.T) {
+	const secret = "s3cr3t-p4ssw0rd"
+	cfg := Config{
+		Server: "vpn.example.com:500",
+		EAP:    EAPMSCHAPv2{Username: "user", Password: secret},
+	}
+	pskCfg := Config{Server: "vpn:500", PSK: secret, LocalID: FQDN("c")}
+
+	for name, rendered := range map[string]string{
+		"config %v":  fmt.Sprintf("%v", cfg),
+		"config %+v": fmt.Sprintf("%+v", cfg),
+		"psk %+v":    fmt.Sprintf("%+v", pskCfg),
+		"eap %v":     fmt.Sprintf("%v", cfg.EAP),
+		"eap %+v":    fmt.Sprintf("%+v", cfg.EAP),
+		"config %s":  fmt.Sprint(cfg),
+	} {
+		if strings.Contains(rendered, secret) {
+			t.Errorf("%s leaks the secret: %s", name, rendered)
+		}
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	logger.Info("dialing", "config", cfg, "eap", cfg.EAP, "psk-config", pskCfg)
+	if out := buf.String(); strings.Contains(out, secret) {
+		t.Errorf("slog output leaks the secret: %s", out)
+	}
+}
+
+// TestConfigValidateFloorsMTU: a pathologically small MTU is raised to MinMTU
+// (go-tun2net only clamps oversized values down); zero still selects the
+// default; sane values pass through.
+func TestConfigValidateFloorsMTU(t *testing.T) {
+	base := func() Config {
+		return Config{Server: "vpn:500", EAP: EAPMSCHAPv2{Username: "u", Password: "p"}}
+	}
+	tiny := base()
+	tiny.MTU = 14
+	if err := tiny.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if tiny.MTU != MinMTU {
+		t.Fatalf("MTU = %d, want floored to %d", tiny.MTU, MinMTU)
+	}
+	zero := base()
+	if err := zero.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if zero.MTU != DefaultMTU {
+		t.Fatalf("MTU = %d, want default %d", zero.MTU, DefaultMTU)
+	}
+	ok := base()
+	ok.MTU = 1300
+	if err := ok.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if ok.MTU != 1300 {
+		t.Fatalf("MTU = %d, want unchanged 1300", ok.MTU)
 	}
 }
