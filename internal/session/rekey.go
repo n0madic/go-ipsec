@@ -595,6 +595,19 @@ func (s *Session) completeIKERekey(ctx context.Context, inner ikemsg.Payloads, p
 // whether the request arrived under the superseded IKE SA (rekey grace window),
 // selecting the matching responder-dedup slot.
 func (s *Session) handleIKERekeyRequest(ctx context.Context, hdr *ikemsg.Message, inner ikemsg.Payloads, dec *ikeCtx, viaOld bool) error {
+	// A server IKE rekey arriving under the superseded SA during the grace window
+	// would force a SECOND cutover keyed from a dying SA, and the subsequent
+	// swapIKE (s.oldPeer = s.peer) would clobber the response we cache below —
+	// leaving a retransmit unanswerable and the request-carrying SA dropped.
+	// Decline with TEMPORARY_FAILURE; the peer retries (RFC 7296 §2.25) once the
+	// grace window has expired and the request arrives under the current SA. The
+	// notify is cached in the oldPeer dedup slot (no swap follows) so a retransmit
+	// of this request is answered from cache rather than reprocessed.
+	if viaOld {
+		s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
+		s.log.Debug("declined server IKE rekey arriving under the superseded SA during grace")
+		return nil
+	}
 	saP, ni, kei, err := ikeRekeyPayloads(inner)
 	if err != nil {
 		// Cache an error response so retransmits are answered, not reprocessed.

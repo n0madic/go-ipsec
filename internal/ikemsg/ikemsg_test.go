@@ -139,7 +139,7 @@ func TestPayloadBodyGolden(t *testing.T) {
 			p: &SAPayload{Proposals: []Proposal{{
 				Number: 1, Protocol: ProtocolIKE,
 				Transforms: []Transform{
-					{Type: TransformEncr, ID: ENCR_AES_CBC, KeyLength: 256},
+					{Type: TransformEncr, ID: ENCR_AES_CBC, KeyLength: 256, HasKeyLength: true},
 					{Type: TransformPRF, ID: PRF_HMAC_SHA2_256},
 					{Type: TransformInteg, ID: AUTH_HMAC_SHA2_256_128},
 					{Type: TransformDH, ID: DH_X25519},
@@ -160,7 +160,7 @@ func TestPayloadBodyGolden(t *testing.T) {
 			p: &SAPayload{Proposals: []Proposal{{
 				Number: 1, Protocol: ProtocolESP, SPI: mh(t, "DEADBEEF"),
 				Transforms: []Transform{
-					{Type: TransformEncr, ID: ENCR_AES_CBC, KeyLength: 256},
+					{Type: TransformEncr, ID: ENCR_AES_CBC, KeyLength: 256, HasKeyLength: true},
 					{Type: TransformInteg, ID: AUTH_HMAC_SHA2_256_128},
 					{Type: TransformESN, ID: ESN_NONE},
 				},
@@ -292,7 +292,7 @@ func TestRoundTripAllPayloads(t *testing.T) {
 			&SAPayload{Proposals: []Proposal{{
 				Number: 1, Protocol: ProtocolESP, SPI: mh(t, "DEADBEEF"),
 				Transforms: []Transform{
-					{Type: TransformEncr, ID: ENCR_AES_CBC, KeyLength: 256},
+					{Type: TransformEncr, ID: ENCR_AES_CBC, KeyLength: 256, HasKeyLength: true},
 					{Type: TransformInteg, ID: AUTH_HMAC_SHA2_256_128},
 					{Type: TransformESN, ID: ESN_NONE},
 				},
@@ -478,7 +478,7 @@ func TestParseNeverPanics(t *testing.T) {
 				&SAPayload{Proposals: []Proposal{{
 					Number: 1, Protocol: ProtocolIKE,
 					Transforms: []Transform{
-						{Type: TransformEncr, ID: ENCR_AES_CBC, KeyLength: 256},
+						{Type: TransformEncr, ID: ENCR_AES_CBC, KeyLength: 256, HasKeyLength: true},
 						{Type: TransformPRF, ID: PRF_HMAC_SHA2_256},
 						{Type: TransformInteg, ID: AUTH_HMAC_SHA2_256_128},
 						{Type: TransformDH, ID: DH_X25519},
@@ -541,7 +541,7 @@ func mustMarshal(t *testing.T, m *Message) []byte {
 // five named slices of the previous codec.
 func TestProposalByType(t *testing.T) {
 	p := Proposal{Transforms: []Transform{
-		{Type: TransformEncr, ID: ENCR_AES_CBC, KeyLength: 256},
+		{Type: TransformEncr, ID: ENCR_AES_CBC, KeyLength: 256, HasKeyLength: true},
 		{Type: TransformDH, ID: DH_X25519},
 		{Type: TransformDH, ID: DH_MODP2048},
 	}}

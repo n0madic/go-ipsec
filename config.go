@@ -272,11 +272,19 @@ func (c *Config) validate() error {
 	}
 	// Cipher-suite lists: unknown values would be silently unofferable and a
 	// duplicate signals a caller-side mixup, so both fail loudly here rather
-	// than at the handshake.
-	if err := validateCipherSuites("ESPCipherSuites", c.ESPCipherSuites); err != nil {
+	// than at the handshake. Each list is validated against its own layer's
+	// suite mapper so an ESP-only (or IKE-only) suite added later cannot slip
+	// through the wrong list and then be silently dropped at offer time.
+	if err := validateCipherSuites("ESPCipherSuites", c.ESPCipherSuites, func(cs CipherSuite) bool {
+		_, ok := cs.espSuite()
+		return ok
+	}); err != nil {
 		return err
 	}
-	if err := validateCipherSuites("IKECipherSuites", c.IKECipherSuites); err != nil {
+	if err := validateCipherSuites("IKECipherSuites", c.IKECipherSuites, func(cs CipherSuite) bool {
+		_, ok := cs.ikeSuite()
+		return ok
+	}); err != nil {
 		return err
 	}
 	if c.MTU == 0 {
@@ -337,12 +345,14 @@ func (c *Config) validate() error {
 }
 
 // validateCipherSuites rejects unknown and duplicate values in a Config
-// cipher-suite list; field names the offending Config field in the error. The
-// ESP and IKE layers implement the same suite set, so one check serves both.
-func validateCipherSuites(field string, suites []CipherSuite) error {
+// cipher-suite list; field names the offending Config field in the error and
+// known reports whether a value maps to a suite implemented by that layer (the
+// ESP and IKE layers happen to share a domain today, but validating each
+// against its own mapper keeps them decoupled).
+func validateCipherSuites(field string, suites []CipherSuite, known func(CipherSuite) bool) error {
 	seen := make(map[CipherSuite]bool, len(suites))
 	for _, cs := range suites {
-		if _, ok := cs.espSuite(); !ok {
+		if !known(cs) {
 			return fmt.Errorf("ipsec: Config.%s: unknown cipher suite %d", field, uint8(cs))
 		}
 		if seen[cs] {

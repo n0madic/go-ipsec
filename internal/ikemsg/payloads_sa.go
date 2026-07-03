@@ -106,9 +106,12 @@ func marshalTransform(t Transform, more bool) []byte {
 	out[4] = byte(t.Type)
 	binary.BigEndian.PutUint16(out[6:8], t.ID)
 
-	if t.HasKeyLength || t.KeyLength != 0 {
+	if t.HasKeyLength {
 		// TV attribute: the high bit (0x8000) flags the TV format, OR'd with the
-		// attribute type; the value is the 2-byte key length in bits.
+		// attribute type; the value is the 2-byte key length in bits. HasKeyLength
+		// is the single source of truth: a transform that must NOT carry the
+		// attribute (ChaCha20-Poly1305, RFC 7634) sets it false even if KeyLength
+		// happens to be zero, and an explicit KEY_LENGTH=0 would still be emitted.
 		var attr [4]byte
 		binary.BigEndian.PutUint16(attr[0:2], 0x8000|AttrKeyLength)
 		binary.BigEndian.PutUint16(attr[2:4], t.KeyLength)

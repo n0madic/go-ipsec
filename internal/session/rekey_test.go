@@ -667,6 +667,94 @@ func TestViaOldServerChildRekey(t *testing.T) {
 	}
 }
 
+// TestViaOldServerIKERekeyDeclined pins the grace-window guard: a SECOND server
+// IKE rekey that arrives under the superseded SA (viaOld=true) must be declined
+// with TEMPORARY_FAILURE, not cut over a second time. A second swap would key
+// off a dying SA and the swapIKE (s.oldPeer = s.peer) would clobber the cached
+// response; declining leaves the current and grace SAs intact and caches the
+// notify in the oldPeer dedup slot so a retransmit is answered from cache.
+func TestViaOldServerIKERekeyDeclined(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	initS.SetDataPlane(&fakeDataPlane{})
+	oldSharedSA := initS.ikeSA // respS stays on this SA throughout
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+
+	// 1) Server IKE rekey → initS cuts over, oldSharedSA retained in grace.
+	dh, err := ikesa.NewDH(ikemsg.DH_MODP2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ikeRaw := serverIKERekey(t, respS, 0, 0x9090, ikemsg.DH_MODP2048, dh.Public, bytes.Repeat([]byte{0xF1}, nonceLen))
+	if exit := initS.handleInbound(ctx, ikeRaw, func() {}); exit {
+		t.Fatal("unexpected teardown on first IKE rekey")
+	}
+	if _, err := respConn.Recv(ctx); err != nil { // drain the IKE rekey response
+		t.Fatal(err)
+	}
+	if initS.oldIKE == nil || initS.oldIKE.sa != oldSharedSA {
+		t.Fatal("old IKE SA not retained for grace decode")
+	}
+	newCurrent := initS.ikeSA
+
+	// 2) A SECOND server IKE rekey encoded under the OLD shared SA (grace window)
+	//    → viaOld=true. It must be declined, not cut over again.
+	dh2, err := ikesa.NewDH(ikemsg.DH_MODP2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqRaw := serverIKERekey(t, respS, 7, 0xA0A0, ikemsg.DH_MODP2048, dh2.Public, bytes.Repeat([]byte{0xF2}, nonceLen))
+	if exit := initS.handleInbound(ctx, reqRaw, func() {}); exit {
+		t.Fatal("unexpected teardown on via-old IKE rekey")
+	}
+	// No second cutover: current SA unchanged and the grace SA is not clobbered.
+	if initS.ikeSA != newCurrent {
+		t.Fatal("via-old IKE rekey wrongly triggered a second cutover")
+	}
+	if initS.oldIKE == nil || initS.oldIKE.sa != oldSharedSA {
+		t.Fatal("via-old IKE rekey clobbered the grace SA")
+	}
+	// Cached into the oldPeer dedup slot (no swap follows to migrate it away).
+	if !initS.oldPeer.set || initS.oldPeer.msgID != 7 {
+		t.Fatal("declined via-old IKE rekey not cached in the oldPeer dedup slot")
+	}
+	// The response is a TEMPORARY_FAILURE notify, decodable under the old SA.
+	respRaw, err := respConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, respInner, _, err := respS.decodeIKE(respRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotTempFail bool
+	for _, p := range respInner {
+		if n, ok := p.(*ikemsg.NotifyPayload); ok && n.Type == ikemsg.NotifyTemporaryFailure {
+			gotTempFail = true
+		}
+	}
+	if !gotTempFail {
+		t.Fatal("declined via-old IKE rekey did not answer TEMPORARY_FAILURE")
+	}
+
+	// Retransmit under the old SA → deduped: resends the cached bytes, no cutover.
+	if exit := initS.handleInbound(ctx, reqRaw, func() {}); exit {
+		t.Fatal("unexpected teardown on via-old retransmit")
+	}
+	respRaw2, err := respConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(respRaw, respRaw2) {
+		t.Fatal("via-old IKE rekey retransmit produced different bytes (reprocessed)")
+	}
+	if initS.ikeSA != newCurrent {
+		t.Fatal("via-old IKE rekey retransmit triggered a cutover")
+	}
+}
+
 // TestChildRekeyErrorDoesNotRearmDeadline pins finding #7: a Child rekey completion
 // that errors must NOT re-arm nextChildRekey off the stale childInstalledAt (no
 // install happened), so the existing retry-backoff deadline stands.
@@ -1572,7 +1660,10 @@ func TestChildRekeyOffersFullSuiteTable(t *testing.T) {
 			saP = v
 		}
 	}
-	if saP == nil || len(saP.Proposals) != len(espSuites) {
+	if saP == nil {
+		t.Fatal("rekey offer missing SA payload")
+	}
+	if len(saP.Proposals) != len(espSuites) {
 		t.Fatalf("rekey offer carries %d proposals, want %d", len(saP.Proposals), len(espSuites))
 	}
 	for i, prop := range saP.Proposals {

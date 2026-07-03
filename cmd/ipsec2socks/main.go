@@ -156,11 +156,11 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 			return
 		}
 		grace := time.NewTimer(5 * time.Second)
-		defer grace.Stop()
 		select {
 		case <-sigCh:
 		case <-grace.C:
 		}
+		grace.Stop() // os.Exit skips defers, so stop the timer inline
 		os.Exit(130)
 	}()
 
