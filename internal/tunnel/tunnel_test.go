@@ -16,7 +16,7 @@ func testSA(t *testing.T) *esp.SA {
 	t.Helper()
 	encr := bytes.Repeat([]byte{0x01}, 32)
 	integ := bytes.Repeat([]byte{0x02}, 32)
-	sa, err := esp.NewSA(0x1111, 0x2222, encr, integ, encr, integ, 64)
+	sa, err := esp.NewSA(esp.SuiteAESCBC256SHA256, 0x1111, 0x2222, encr, integ, encr, integ, 64)
 	if err != nil {
 		t.Fatal(err)
 	}

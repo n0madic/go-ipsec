@@ -61,4 +61,27 @@ ip -6 addr add "$V6_TARGET/128" dev lo 2>/dev/null || true
 # $V6_TARGET is accepted regardless of which address the kernel selects.
 socat TCP6-LISTEN:"$V6_PORT",fork,reuseaddr EXEC:/bin/cat &
 
+# --- ChaCha20-Poly1305 availability gate ---------------------------------------
+# The e2e cipher-suite matrix pins each ESP suite in turn; if the strongSwan
+# build lacks the chapoly plugin the ChaCha leg would fail with a confusing
+# NO_PROPOSAL_CHOSEN instead of a clear startup error. Probe listalgs once
+# charon is up and kill the container (PID 1) on absence so `make e2e-up`
+# times out with this message in the logs.
+(
+	for _ in $(seq 1 30); do
+		if ipsec status >/dev/null 2>&1; then
+			if ipsec listalgs | grep -qi chacha; then
+				echo "chacha20poly1305 available"
+			else
+				echo "FATAL: strongSwan lacks ChaCha20-Poly1305 (chapoly plugin); the e2e cipher matrix cannot run" >&2
+				kill -TERM 1
+			fi
+			exit 0
+		fi
+		sleep 1
+	done
+	echo "FATAL: charon did not come up within 30s" >&2
+	kill -TERM 1
+) &
+
 exec ipsec start --nofork

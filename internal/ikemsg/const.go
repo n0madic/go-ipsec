@@ -71,14 +71,17 @@ const (
 	TransformESN   TransformType = 5 // Extended Sequence Numbers (ESN)
 )
 
-// Transform IDs for the single algorithm suite this client implements, taken
-// directly from the IANA "IKEv2 Transform Type Values" registries (RFC 7296 §3.3.2,
+// Transform IDs for the algorithm suites this client implements, taken directly
+// from the IANA "IKEv2 Transform Type Values" registries (RFC 7296 §3.3.2,
 // RFC 8247). Each is scoped to its TransformType, so the numeric spaces overlap
 // (ENCR_AES_CBC and AUTH_HMAC_SHA2_256_128 are both 12 under different types).
-// internal/ikesa implements exactly these.
+// internal/ikesa (IKE) and internal/esp (ESP) implement exactly these.
 const (
 	ENCR_AES_CBC           uint16 = 12 // ENCR, with a Key Length attribute
+	ENCR_AES_GCM_16        uint16 = 20 // ENCR, AEAD with a 16-octet ICV (RFC 4106)
+	ENCR_CHACHA20_POLY1305 uint16 = 28 // ENCR, AEAD, no Key Length attribute (RFC 7634)
 	PRF_HMAC_SHA2_256      uint16 = 5  // PRF
+	AUTH_NONE              uint16 = 0  // INTEG: no integrity (AEAD proposals)
 	AUTH_HMAC_SHA2_256_128 uint16 = 12 // INTEG (RFC 4868)
 	DH_MODP2048            uint16 = 14 // D-H group 14, 2048-bit MODP
 	DH_X25519              uint16 = 31 // D-H group 31, Curve25519 (RFC 8031)

@@ -25,12 +25,13 @@ type Proposal struct {
 }
 
 // Transform is one transform within a proposal (RFC 7296 §3.3.2). KeyLength carries
-// the Key Length attribute (RFC 7296 §3.3.5) in bits; 0 means the attribute is
-// absent. It is the only transform attribute this client models.
+// the Key Length attribute (RFC 7296 §3.3.5) in bits when HasKeyLength is true.
+// It is the only transform attribute this client models.
 type Transform struct {
-	Type      TransformType
-	ID        uint16
-	KeyLength uint16
+	Type         TransformType
+	ID           uint16
+	KeyLength    uint16
+	HasKeyLength bool
 }
 
 // ByType returns the transforms of the given type, in order. Suite matching reads
@@ -94,7 +95,8 @@ func marshalProposal(p *Proposal, more bool) ([]byte, error) {
 
 // marshalTransform encodes one transform substructure (RFC 7296 §3.3.2). more is
 // the first octet: 3 ("more transforms follow") for any but the last, 0 for the
-// last. A non-zero KeyLength is appended as a 4-byte TV attribute (RFC 7296 §3.3.5).
+// last. A present KeyLength attribute is appended as a 4-byte TV attribute
+// (RFC 7296 §3.3.5).
 func marshalTransform(t Transform, more bool) []byte {
 	// Header: more(1) | RESERVED(1) | Length(2) | Type(1) | RESERVED(1) | ID(2)
 	out := make([]byte, 8)
@@ -104,7 +106,7 @@ func marshalTransform(t Transform, more bool) []byte {
 	out[4] = byte(t.Type)
 	binary.BigEndian.PutUint16(out[6:8], t.ID)
 
-	if t.KeyLength != 0 {
+	if t.HasKeyLength || t.KeyLength != 0 {
 		// TV attribute: the high bit (0x8000) flags the TV format, OR'd with the
 		// attribute type; the value is the 2-byte key length in bits.
 		var attr [4]byte
@@ -186,6 +188,7 @@ func parseTransforms(body []byte) ([]Transform, error) {
 				// TV form: 2-byte type (high bit set) | 2-byte value.
 				if af&0x7fff == AttrKeyLength {
 					t.KeyLength = binary.BigEndian.Uint16(attrs[2:4])
+					t.HasKeyLength = true
 				}
 				attrs = attrs[4:]
 				continue

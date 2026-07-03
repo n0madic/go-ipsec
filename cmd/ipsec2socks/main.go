@@ -155,9 +155,11 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 		case <-rootCtx.Done():
 			return
 		}
+		grace := time.NewTimer(5 * time.Second)
+		defer grace.Stop()
 		select {
 		case <-sigCh:
-		case <-time.After(5 * time.Second):
+		case <-grace.C:
 		}
 		os.Exit(130)
 	}()

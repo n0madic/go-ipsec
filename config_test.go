@@ -324,3 +324,66 @@ func TestConfigValidateFloorsMTU(t *testing.T) {
 		t.Fatalf("MTU = %d, want unchanged 1300", ok.MTU)
 	}
 }
+
+// TestConfigValidateESPCipherSuites: unknown and duplicate suite values fail
+// validation; nil and every defined value (in any order) pass; the mapping into
+// internal ESP suite ids preserves the caller's preference order.
+func TestConfigValidateESPCipherSuites(t *testing.T) {
+	base := func() Config {
+		return Config{Server: "vpn:500", EAP: EAPMSCHAPv2{Username: "u", Password: "p"}}
+	}
+
+	nilSuites := base()
+	if err := nilSuites.validate(); err != nil {
+		t.Fatalf("nil ESPCipherSuites rejected: %v", err)
+	}
+	if got := espSuitesFromConfig(nilSuites.ESPCipherSuites); got != nil {
+		t.Fatalf("nil ESPCipherSuites mapped to %v, want nil (full built-in table)", got)
+	}
+
+	all := base()
+	all.ESPCipherSuites = []CipherSuite{CipherSuiteAESCBC256SHA256, CipherSuiteAESGCM256, CipherSuiteChaCha20Poly1305}
+	if err := all.validate(); err != nil {
+		t.Fatalf("full suite list rejected: %v", err)
+	}
+	want := []esp.Suite{esp.SuiteAESCBC256SHA256, esp.SuiteAESGCM256, esp.SuiteChaCha20Poly1305}
+	got := espSuitesFromConfig(all.ESPCipherSuites)
+	if len(got) != len(want) {
+		t.Fatalf("mapped %d suites, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("suite %d mapped to %v, want %v (preference order lost)", i, got[i], want[i])
+		}
+	}
+
+	unknown := base()
+	unknown.ESPCipherSuites = []CipherSuite{CipherSuite(99)}
+	if err := unknown.validate(); err == nil {
+		t.Fatal("unknown cipher suite accepted")
+	}
+
+	dup := base()
+	dup.ESPCipherSuites = []CipherSuite{CipherSuiteAESGCM256, CipherSuiteAESGCM256}
+	if err := dup.validate(); err == nil {
+		t.Fatal("duplicate cipher suite accepted")
+	}
+}
+
+// TestCipherSuiteString pins the diagnostic names (shared with the internal
+// esp.Suite names, matching strongSwan's algorithm spelling).
+func TestCipherSuiteString(t *testing.T) {
+	cases := map[CipherSuite]string{
+		CipherSuiteAESGCM256:        "aes256gcm16",
+		CipherSuiteChaCha20Poly1305: "chacha20poly1305",
+		CipherSuiteAESCBC256SHA256:  "aes256-sha256",
+	}
+	for cs, want := range cases {
+		if got := cs.String(); got != want {
+			t.Errorf("%d.String() = %q, want %q", uint8(cs), got, want)
+		}
+	}
+	if got := CipherSuite(99).String(); !strings.Contains(got, "99") {
+		t.Errorf("unknown suite String() = %q, want the numeric value in it", got)
+	}
+}

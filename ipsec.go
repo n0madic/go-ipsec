@@ -304,7 +304,9 @@ func (c *Client) Close() error {
 			}
 		}
 		if c.tun != nil {
-			_ = c.tun.Close()
+			if err := c.tun.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		c.stopGraceTimers()
 		if s := c.curSession(); s != nil {
@@ -335,6 +337,7 @@ func toSessionConfig(cfg Config) session.Config {
 		ReplayWindow:     cfg.ReplayWindow,
 		RekeyMaxPackets:  cfg.RekeyMaxPackets,
 		ChildSAPFS:       cfg.ChildSAPFS,
+		ESPSuites:        espSuitesFromConfig(cfg.ESPCipherSuites),
 		RequestIPv6:      cfg.requestIPv6Enabled(),
 		RetransmitBase:   DefaultRetransmitBase,
 		RetransmitMax:    DefaultRetransmitMax,
@@ -356,4 +359,20 @@ func toSessionConfig(cfg Config) session.Config {
 		sc.Dialer = cfg.Transport.DialPacket
 	}
 	return sc
+}
+
+// espSuitesFromConfig maps the public ESPCipherSuites (already validated) into
+// internal ESP suite ids, preserving the preference order; nil stays nil (the
+// session then offers its full built-in table).
+func espSuitesFromConfig(suites []CipherSuite) []esp.Suite {
+	if len(suites) == 0 {
+		return nil
+	}
+	out := make([]esp.Suite, 0, len(suites))
+	for _, cs := range suites {
+		if id, ok := cs.espSuite(); ok {
+			out = append(out, id)
+		}
+	}
+	return out
 }

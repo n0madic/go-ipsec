@@ -405,7 +405,7 @@ func TestChildRekeyResponderInstallsBeforeSend(t *testing.T) {
 
 	var inner ikemsg.Payloads
 	inner = append(inner, &ikemsg.NotifyPayload{Protocol: ikemsg.ProtocolESP, Type: ikemsg.NotifyRekeySA, SPI: []byte{0, 0, 0x22, 0x22}})
-	inner = append(inner, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, []byte{0xAB, 0xCD, 0xEF, 0x40})}})
+	inner = append(inner, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalCBC(1, []byte{0xAB, 0xCD, 0xEF, 0x40})}})
 	inner = append(inner, &ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xD4}, nonceLen)})
 	appendTrafficSelectors(&inner, false)
 	reqRaw, err := encodeSKWith(respS.ikeSA, respS.initiatorSPI, respS.responderSPI,

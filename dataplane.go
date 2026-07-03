@@ -54,6 +54,7 @@ func (c *Client) startDataPlane() error {
 // initiator (we send to ResponderSPI, the peer sends to InitiatorSPI).
 func (c *Client) espSAFromChild(child *session.ChildSA) (*esp.SA, error) {
 	return esp.NewSA(
+		child.Suite,
 		child.ResponderSPI, child.InitiatorSPI,
 		child.Keys.EncrIR, child.Keys.IntegIR,
 		child.Keys.EncrRI, child.Keys.IntegRI,
@@ -271,7 +272,7 @@ func (c *Client) removeInbound(spi uint32, want *esp.SA) {
 // rekey hooks. It implements session.DataPlane and is called only from the IKE
 // driver goroutine.
 func (c *Client) InstallChildSA(u session.ChildSAUpdate) {
-	sa, err := esp.NewSA(u.NewOutSPI, u.NewInSPI, u.OutEncr, u.OutInteg, u.InEncr, u.InInteg, c.cfg.ReplayWindow)
+	sa, err := esp.NewSA(u.Suite, u.NewOutSPI, u.NewInSPI, u.OutEncr, u.OutInteg, u.InEncr, u.InInteg, c.cfg.ReplayWindow)
 	if err != nil {
 		c.cfg.Logger.Error("rekey: failed to build new Child SA", "err", err)
 		return
@@ -294,7 +295,7 @@ func (c *Client) InstallChildSA(u session.ChildSAUpdate) {
 	c.tun.SwapSA(sa)
 	c.fireRekey()
 	c.cfg.Logger.Info("Child SA rekeyed",
-		"newInSPI", u.NewInSPI, "newOutSPI", u.NewOutSPI, "oldInSPI", u.OldInSPI)
+		"newInSPI", u.NewInSPI, "newOutSPI", u.NewOutSPI, "oldInSPI", u.OldInSPI, "suite", u.Suite)
 
 	// Skip grace-removal when a fresh random NewInSPI collided with OldInSPI:
 	// removing it would delete the inbound SA just installed above, black-holing

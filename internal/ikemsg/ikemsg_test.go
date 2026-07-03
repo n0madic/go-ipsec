@@ -617,7 +617,7 @@ func TestParseTransformsIgnoresNonKeyLengthTV(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].KeyLength != 256 {
+	if len(got) != 1 || got[0].KeyLength != 256 || !got[0].HasKeyLength {
 		t.Fatalf("Key Length attribute not parsed: %+v", got)
 	}
 
@@ -626,7 +626,7 @@ func TestParseTransformsIgnoresNonKeyLengthTV(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].KeyLength != 0 {
+	if len(got) != 1 || got[0].KeyLength != 0 || got[0].HasKeyLength {
 		t.Fatalf("non-Key-Length TV attribute mis-parsed into KeyLength: %+v", got)
 	}
 }
@@ -649,7 +649,7 @@ func TestParseTransformsKeyLengthNotFirstAttribute(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(got) != 1 || got[0].KeyLength != 256 {
+		if len(got) != 1 || got[0].KeyLength != 256 || !got[0].HasKeyLength {
 			t.Fatalf("KeyLength not surfaced as the 2nd attribute: %+v", got)
 		}
 	})
@@ -668,7 +668,7 @@ func TestParseTransformsKeyLengthNotFirstAttribute(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(got) != 1 || got[0].KeyLength != 256 {
+		if len(got) != 1 || got[0].KeyLength != 256 || !got[0].HasKeyLength {
 			t.Fatalf("KeyLength not surfaced after a TLV attribute: %+v", got)
 		}
 	})

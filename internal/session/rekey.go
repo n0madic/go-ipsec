@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/n0madic/go-ipsec/internal/esp"
 	"github.com/n0madic/go-ipsec/internal/ikemsg"
 	"github.com/n0madic/go-ipsec/internal/ikesa"
 )
@@ -30,11 +31,13 @@ type DataPlane interface {
 }
 
 // ChildSAUpdate carries a rekeyed Child SA, with keys already oriented for this
-// client (Out* = our outbound, In* = our inbound).
+// client (Out* = our outbound, In* = our inbound). Suite selects the ESP
+// transform the keys were derived for (a rekey may change the suite).
 type ChildSAUpdate struct {
 	NewInSPI  uint32
 	NewOutSPI uint32
 	OldInSPI  uint32 // 0 → no predecessor (first install)
+	Suite     esp.Suite
 	OutEncr   []byte
 	OutInteg  []byte
 	InEncr    []byte
@@ -135,10 +138,12 @@ func (s *Session) initiateChildRekey(ctx context.Context, reestablish bool) erro
 		binary.BigEndian.PutUint32(oldSPI[:], s.child.InitiatorSPI)
 		inner = append(inner, &ikemsg.NotifyPayload{Protocol: ikemsg.ProtocolESP, Type: ikemsg.NotifyRekeySA, SPI: oldSPI[:]})
 	}
+	// Offer the full enabled suite table again (a rekey may migrate the Child SA
+	// to a more preferred suite the server has since enabled).
 	if dh != nil {
-		inner = append(inner, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalPFS(1, newSPI, dh.Group)}})
+		inner = append(inner, &ikemsg.SAPayload{Proposals: buildESPProposals(newSPI, s.enabledESPSuites(), dh.Group)})
 	} else {
-		inner = append(inner, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, newSPI)}})
+		inner = append(inner, &ikemsg.SAPayload{Proposals: buildESPProposals(newSPI, s.enabledESPSuites())})
 	}
 	inner = append(inner, &ikemsg.NoncePayload{Data: ni})
 	if dh != nil {
@@ -187,7 +192,7 @@ func (s *Session) childRekeyGroup() uint16 {
 // Either way InstallChildSA carries the old inbound SPI so the data plane
 // grace-removes it after childSAGrace rather than dropping it eagerly.
 func (s *Session) completeChildRekey(ctx context.Context, inner ikemsg.Payloads, p *pendingExchange) error {
-	prop, nr, ke, err := childRekeyResponse(inner)
+	prop, suite, nr, ke, err := s.childRekeyResponse(inner)
 	if err != nil {
 		return err
 	}
@@ -207,7 +212,7 @@ func (s *Session) completeChildRekey(ctx context.Context, inner ikemsg.Payloads,
 		if derr != nil {
 			return fmt.Errorf("session: Child SA rekey DH: %w", derr)
 		}
-		keys = s.ikeSA.DeriveChildKeysPFS(shared, p.child.ni, nr, espEncrKeyLen, espIntegKeyLen)
+		keys = s.ikeSA.DeriveChildKeysPFS(shared, p.child.ni, nr, suite.encrKeyLen, suite.integKeyLen)
 	case ke != nil:
 		// We did not offer PFS but the responder returned a KE — it cannot add a DH
 		// exchange we never requested (RFC 7296 §2.17) and we hold no private to
@@ -224,14 +229,15 @@ func (s *Session) completeChildRekey(ctx context.Context, inner ikemsg.Payloads,
 		if p.child.dh != nil && selectedDHGroup(prop) != 0 {
 			return errors.New("session: Child SA rekey response selected a DH group but omitted the KE payload")
 		}
-		keys = s.ikeSA.DeriveChildKeys(p.child.ni, nr, espEncrKeyLen, espIntegKeyLen)
+		keys = s.ikeSA.DeriveChildKeys(p.child.ni, nr, suite.encrKeyLen, suite.integKeyLen)
 	}
 	s.dataPlane.InstallChildSA(ChildSAUpdate{
 		NewInSPI: p.child.newInSPI, NewOutSPI: respSPI, OldInSPI: p.child.oldInSPI,
+		Suite:   suite.id,
 		OutEncr: keys.EncrIR, OutInteg: keys.IntegIR,
 		InEncr: keys.EncrRI, InInteg: keys.IntegRI,
 	})
-	s.child = &ChildSA{InitiatorSPI: p.child.newInSPI, ResponderSPI: respSPI, Keys: keys}
+	s.child = &ChildSA{InitiatorSPI: p.child.newInSPI, ResponderSPI: respSPI, Suite: suite.id, Keys: keys}
 	s.childInstalledAt = time.Now()
 	// A peer DELETE of the SA this rekey just replaced may have queued a
 	// re-establishment while the exchange was in flight (window size 1). The
@@ -264,27 +270,49 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 		s.sendNotifyResponse(ctx, dec, hdr.MessageID, viaOld, ikemsg.ProtocolESP, ikemsg.NotifyChildSANotFound, nil, "child rekey: no Child SA")
 		return errors.New("session: rekey request but no Child SA")
 	}
-	prop, ni, ke, reqTSi, reqTSr, err := childRekeyRequest(inner)
+	saP, ni, ke, reqTSi, reqTSr, err := childRekeyRequestPayloads(inner)
 	if err != nil {
 		s.sendNotifyResponse(ctx, dec, hdr.MessageID, viaOld, ikemsg.ProtocolESP, ikemsg.NotifyNoProposalChosen, nil, "child rekey: no proposal chosen")
 		return err
 	}
+	// A KE payload means the peer wants per-Child PFS. Honor it when the group is
+	// one we run (x25519 or MODP-2048) and it is advertised by a proposal that
+	// matches an enabled suite; otherwise tell the peer which group we accept
+	// (RFC 7296 §1.3) — this is a clean answer, not a failure, so the peer can
+	// retry with a supported group.
+	var requireGroup uint16
+	if ke != nil {
+		if !supportedDHGroup(ke.Group) {
+			s.sendInvalidKEPayload(ctx, dec, hdr.MessageID, viaOld)
+			s.log.Debug("declined Child PFS rekey: unsupported KE group", "group", ke.Group)
+			return nil
+		}
+		requireGroup = ke.Group
+	}
+	// Pick our most-preferred enabled suite among the offered proposals. With a
+	// KE present the matched proposal must also advertise the KE group: the DH
+	// exchange may only run against a proposal that offered it, and the group may
+	// be spread across only some of the peer's proposals.
+	prop, suite, ok := selectESPProposal(saP, s.enabledESPSuites(), requireGroup)
+	if !ok {
+		if requireGroup != 0 {
+			if _, _, okSansGroup := selectESPProposal(saP, s.enabledESPSuites(), 0); okSansGroup {
+				// A suite matches, but no matching proposal advertises the KE group —
+				// answer with the group we accept so the peer can retry.
+				s.sendInvalidKEPayload(ctx, dec, hdr.MessageID, viaOld)
+				s.log.Debug("declined Child PFS rekey: KE group not offered by a matching proposal", "group", requireGroup)
+				return nil
+			}
+		}
+		s.sendNotifyResponse(ctx, dec, hdr.MessageID, viaOld, ikemsg.ProtocolESP, ikemsg.NotifyNoProposalChosen, nil, "child rekey: no proposal chosen")
+		return fmt.Errorf("session: no offered ESP proposal matches our suites (%s)", describeProposals(saP))
+	}
 	serverNewSPI := binary.BigEndian.Uint32(prop.SPI)
 
-	// A KE payload means the peer wants per-Child PFS. Honor it when the group is
-	// one we run (x25519 or MODP-2048) and the proposal advertises it; otherwise
-	// tell the peer which group we accept (RFC 7296 §1.3) — this is a clean answer,
-	// not a failure, so the peer can retry with a supported group.
 	var dh *ikesa.DH
 	var pfsShared []byte
 	if ke != nil {
-		group := ke.Group
-		if !supportedDHGroup(group) || !proposalHasDHGroup(prop, group) {
-			s.sendInvalidKEPayload(ctx, dec, hdr.MessageID, viaOld)
-			s.log.Debug("declined Child PFS rekey: unsupported KE group", "group", group)
-			return nil
-		}
-		if dh, err = ikesa.NewDH(group); err != nil {
+		if dh, err = ikesa.NewDH(ke.Group); err != nil {
 			return err
 		}
 		if pfsShared, err = dh.Shared(ke.Data); err != nil {
@@ -302,13 +330,15 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 	}
 
 	var resp ikemsg.Payloads
-	// Echo the selected proposal number with our single chosen suite (RFC 7296
-	// §2.7: the responder narrows the offer to one transform per type). A PFS
-	// rekey keeps the DH-group transform and answers with our own KE payload.
+	// Echo the selected proposal number, narrowed to the SELECTED suite (RFC
+	// 7296 §2.7: the responder narrows the offer to one transform per type) —
+	// not a rebuild of some fixed suite, which would desync KEYMAT whenever the
+	// peer's preferred offer differs. A PFS rekey keeps the DH-group transform
+	// and answers with our own KE payload.
 	if dh != nil {
-		resp = append(resp, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalPFS(prop.Number, newSPI, dh.Group)}})
+		resp = append(resp, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalForSuite(prop.Number, suite, newSPI, dh.Group)}})
 	} else {
-		resp = append(resp, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(prop.Number, newSPI)}})
+		resp = append(resp, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalForSuite(prop.Number, suite, newSPI)}})
 	}
 	resp = append(resp, &ikemsg.NoncePayload{Data: nr})
 	if dh != nil {
@@ -343,21 +373,22 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 	// single-goroutine, so no retransmit is reprocessed before we cache below.
 	var keys ikesa.ChildKeys
 	if pfsShared != nil {
-		keys = dec.sa.DeriveChildKeysPFS(pfsShared, ni, nr, espEncrKeyLen, espIntegKeyLen)
+		keys = dec.sa.DeriveChildKeysPFS(pfsShared, ni, nr, suite.encrKeyLen, suite.integKeyLen)
 		// Latch PFS and the group the server required, so our own subsequent
 		// rekeys/re-establishments offer the same group.
 		s.childPFS = true
 		s.childPFSGroup = dh.Group
 	} else {
-		keys = dec.sa.DeriveChildKeys(ni, nr, espEncrKeyLen, espIntegKeyLen)
+		keys = dec.sa.DeriveChildKeys(ni, nr, suite.encrKeyLen, suite.integKeyLen)
 	}
 	oldInSPI := s.child.InitiatorSPI
 	s.dataPlane.InstallChildSA(ChildSAUpdate{
 		NewInSPI: binary.BigEndian.Uint32(newSPI), NewOutSPI: serverNewSPI, OldInSPI: oldInSPI,
+		Suite:   suite.id,
 		OutEncr: keys.EncrRI, OutInteg: keys.IntegRI,
 		InEncr: keys.EncrIR, InInteg: keys.IntegIR,
 	})
-	s.child = &ChildSA{InitiatorSPI: binary.BigEndian.Uint32(newSPI), ResponderSPI: serverNewSPI, Keys: keys}
+	s.child = &ChildSA{InitiatorSPI: binary.BigEndian.Uint32(newSPI), ResponderSPI: serverNewSPI, Suite: suite.id, Keys: keys}
 	s.childInstalledAt = time.Now()
 	// A server-driven install resets the soft lifetime; push our own next-Child-
 	// rekey deadline out from the new install time (otherwise it stays armed on the
@@ -370,7 +401,8 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 	if err := s.sendDatagram(ctx, raw); err != nil {
 		return err
 	}
-	s.log.Debug("answered server Child SA rekey", "newInSPI", binary.BigEndian.Uint32(newSPI), "pfs", pfsShared != nil)
+	s.log.Debug("answered server Child SA rekey",
+		"newInSPI", binary.BigEndian.Uint32(newSPI), "suite", suite.name(), "pfs", pfsShared != nil)
 	return nil
 }
 
@@ -403,7 +435,12 @@ func (s *Session) sendChildDelete(ctx context.Context, inSPI uint32) error {
 	return s.sendDatagram(ctx, raw)
 }
 
-func childRekeyResponse(inner ikemsg.Payloads) (prop ikemsg.Proposal, nr []byte, ke *ikemsg.KEPayload, err error) {
+// childRekeyResponse decodes the responder's answer to a Child SA rekey we
+// initiated. The SA payload must be a strict SELECTION of one enabled suite
+// (exactly one ENCR transform, unambiguous integrity — the same semantics as
+// the IKE_AUTH selection): with several suites offered, a response echoing
+// multiple alternatives would leave the KEYMAT lengths undefined.
+func (s *Session) childRekeyResponse(inner ikemsg.Payloads) (prop ikemsg.Proposal, suite espSuite, nr []byte, ke *ikemsg.KEPayload, err error) {
 	var saP *ikemsg.SAPayload
 	for _, p := range inner {
 		switch v := p.(type) {
@@ -415,25 +452,31 @@ func childRekeyResponse(inner ikemsg.Payloads) (prop ikemsg.Proposal, nr []byte,
 			ke = v
 		case *ikemsg.NotifyPayload:
 			if e := notifyError(v); e != nil {
-				return ikemsg.Proposal{}, nil, nil, e
+				return ikemsg.Proposal{}, espSuite{}, nil, nil, e
 			}
 		}
 	}
 	if saP == nil {
-		return ikemsg.Proposal{}, nil, nil, errors.New("session: Child SA rekey response missing SA payload")
+		return ikemsg.Proposal{}, espSuite{}, nil, nil, errors.New("session: Child SA rekey response missing SA payload")
 	}
-	prop, ok := selectESPProposal(saP)
-	if !ok {
-		return ikemsg.Proposal{}, nil, nil, fmt.Errorf("session: Child SA rekey response selected an unsupported proposal (%s)", describeProposals(saP))
+	if len(saP.Proposals) == 0 {
+		return ikemsg.Proposal{}, espSuite{}, nil, nil, errors.New("session: Child SA rekey response carries no proposal")
+	}
+	prop = saP.Proposals[0]
+	suite, ok := selectedESPSuite(prop, s.enabledESPSuites())
+	if !ok || len(prop.SPI) != 4 {
+		return ikemsg.Proposal{}, espSuite{}, nil, nil, fmt.Errorf("session: Child SA rekey response selected an unsupported or ambiguous proposal (%s)", describeProposals(saP))
 	}
 	if len(nr) == 0 {
-		return ikemsg.Proposal{}, nil, nil, errors.New("session: Child SA rekey response missing Nr")
+		return ikemsg.Proposal{}, espSuite{}, nil, nil, errors.New("session: Child SA rekey response missing Nr")
 	}
-	return prop, nr, ke, nil
+	return prop, suite, nr, ke, nil
 }
 
-func childRekeyRequest(inner ikemsg.Payloads) (prop ikemsg.Proposal, ni []byte, ke *ikemsg.KEPayload, tsi, tsr []ikemsg.TrafficSelector, err error) {
-	var saP *ikemsg.SAPayload
+// childRekeyRequestPayloads extracts the payloads of a server-initiated Child
+// SA rekey request. Proposal/suite selection is left to the caller, which
+// re-selects with the KE group as a constraint when the peer requested PFS.
+func childRekeyRequestPayloads(inner ikemsg.Payloads) (saP *ikemsg.SAPayload, ni []byte, ke *ikemsg.KEPayload, tsi, tsr []ikemsg.TrafficSelector, err error) {
 	for _, p := range inner {
 		switch v := p.(type) {
 		case *ikemsg.SAPayload:
@@ -456,16 +499,12 @@ func childRekeyRequest(inner ikemsg.Payloads) (prop ikemsg.Proposal, ni []byte, 
 		}
 	}
 	if saP == nil {
-		return ikemsg.Proposal{}, nil, nil, nil, nil, errors.New("session: Child SA rekey request missing SA payload")
-	}
-	prop, ok := selectESPProposal(saP)
-	if !ok {
-		return ikemsg.Proposal{}, nil, nil, nil, nil, fmt.Errorf("session: no offered ESP proposal matches our suite (%s)", describeProposals(saP))
+		return nil, nil, nil, nil, nil, errors.New("session: Child SA rekey request missing SA payload")
 	}
 	if len(ni) == 0 {
-		return ikemsg.Proposal{}, nil, nil, nil, nil, errors.New("session: Child SA rekey request missing Ni")
+		return nil, nil, nil, nil, nil, errors.New("session: Child SA rekey request missing Ni")
 	}
-	return prop, ni, ke, tsi, tsr, nil
+	return saP, ni, ke, tsi, tsr, nil
 }
 
 // --- IKE SA rekey ---

@@ -45,10 +45,12 @@ const (
 // Only stdlib-shaped fields are exposed; everything provider-specific lives in the
 // caller.
 //
-// The cipher suite is fixed and not configurable: AES-CBC-256 encryption,
-// PRF-HMAC-SHA2-256, AUTH-HMAC-SHA2-256-128 integrity, and a DH group of
-// x25519 (group 31, preferred) or MODP-2048 (group 14, fallback) negotiated at
-// IKE_SA_INIT. The Child SA reuses AES-CBC-256 + HMAC-SHA2-256-128.
+// The IKE SA cipher suite is fixed: AES-CBC-256 encryption, PRF-HMAC-SHA2-256,
+// AUTH-HMAC-SHA2-256-128 integrity, and a DH group of x25519 (group 31,
+// preferred) or MODP-2048 (group 14, fallback) negotiated at IKE_SA_INIT. The
+// ESP (Child SA) suite IS negotiated, from the suites in ESPCipherSuites
+// (default preference: AES-256-GCM-16, ChaCha20-Poly1305, then AES-CBC-256 +
+// HMAC-SHA2-256-128).
 type Config struct {
 	// Server is the responder endpoint, host:port. Port defaults to 500.
 	Server string
@@ -100,6 +102,14 @@ type Config struct {
 	// constant rekey churn.
 	RekeyMaxPackets uint32
 
+	// ESPCipherSuites restricts and orders the ESP cipher suites offered for
+	// the Child SA, most-preferred first. nil or empty offers every implemented
+	// suite in the default preference order (AES-256-GCM-16, ChaCha20-Poly1305,
+	// AES-CBC-256+HMAC-SHA2-256-128). Use it to pin a single suite (e.g. an
+	// AES-only operator policy) or to reorder the preference; unknown or
+	// duplicate values fail validation. The IKE SA suite is not affected.
+	ESPCipherSuites []CipherSuite
+
 	// ChildSAPFS offers per-Child Perfect Forward Secrecy (a fresh MODP-2048 /
 	// group 14 Diffie-Hellman exchange) on Child SA rekeys this client initiates.
 	// A server-initiated PFS rekey is always honored regardless of this setting,
@@ -133,6 +143,47 @@ type Config struct {
 	ReconnectBackoffBase    time.Duration
 	ReconnectBackoffMax     time.Duration
 	ReconnectAttemptTimeout time.Duration
+}
+
+// CipherSuite selects an ESP transform suite for Config.ESPCipherSuites.
+type CipherSuite uint8
+
+const (
+	// CipherSuiteAESGCM256 is AES-GCM with a 256-bit key and a 16-octet ICV
+	// (ENCR_AES_GCM_16, RFC 4106) — an AEAD suite, hardware-accelerated on
+	// most CPUs.
+	CipherSuiteAESGCM256 CipherSuite = iota + 1
+	// CipherSuiteChaCha20Poly1305 is ChaCha20-Poly1305
+	// (ENCR_CHACHA20_POLY1305, RFC 7634) — an AEAD suite, fast without AES
+	// hardware.
+	CipherSuiteChaCha20Poly1305
+	// CipherSuiteAESCBC256SHA256 is AES-CBC-256 encryption with
+	// HMAC-SHA2-256-128 integrity (RFC 3602 + RFC 4868) — the RFC-mandatory
+	// baseline every IKEv2 gateway supports.
+	CipherSuiteAESCBC256SHA256
+)
+
+// espSuite maps the public constant to the internal ESP suite id; ok is false
+// for values outside the defined set.
+func (cs CipherSuite) espSuite() (esp.Suite, bool) {
+	switch cs {
+	case CipherSuiteAESGCM256:
+		return esp.SuiteAESGCM256, true
+	case CipherSuiteChaCha20Poly1305:
+		return esp.SuiteChaCha20Poly1305, true
+	case CipherSuiteAESCBC256SHA256:
+		return esp.SuiteAESCBC256SHA256, true
+	default:
+		return 0, false
+	}
+}
+
+// String implements fmt.Stringer with the conventional transform names.
+func (cs CipherSuite) String() string {
+	if id, ok := cs.espSuite(); ok {
+		return id.String()
+	}
+	return fmt.Sprintf("ipsec-cipher-suite-%d", uint8(cs))
 }
 
 // autoReconnectEnabled resolves the AutoReconnect tri-state: enabled unless the
@@ -190,6 +241,19 @@ func (c *Config) validate() error {
 	}
 	if err := c.RemoteID.check(); err != nil {
 		return fmt.Errorf("ipsec: Config.RemoteID: %w", err)
+	}
+	// ESP suites: unknown values would be silently unofferable and a duplicate
+	// signals a caller-side mixup, so both fail loudly here rather than at the
+	// handshake.
+	seenSuites := make(map[CipherSuite]bool, len(c.ESPCipherSuites))
+	for _, cs := range c.ESPCipherSuites {
+		if _, ok := cs.espSuite(); !ok {
+			return fmt.Errorf("ipsec: Config.ESPCipherSuites: unknown cipher suite %d", uint8(cs))
+		}
+		if seenSuites[cs] {
+			return fmt.Errorf("ipsec: Config.ESPCipherSuites: duplicate cipher suite %v", cs)
+		}
+		seenSuites[cs] = true
 	}
 	if c.MTU == 0 {
 		c.MTU = DefaultMTU

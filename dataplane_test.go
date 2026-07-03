@@ -34,11 +34,11 @@ func TestDataPlaneLoopback(t *testing.T) {
 	integRI := bytes.Repeat([]byte{0x04}, 32)
 
 	const initSPI, respSPI = 0x1111, 0x2222
-	initSA, err := esp.NewSA(respSPI, initSPI, encrIR, integIR, encrRI, integRI, 64)
+	initSA, err := esp.NewSA(esp.SuiteAESCBC256SHA256, respSPI, initSPI, encrIR, integIR, encrRI, integRI, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
-	respSA, err := esp.NewSA(initSPI, respSPI, encrRI, integRI, encrIR, integIR, 64)
+	respSA, err := esp.NewSA(esp.SuiteAESCBC256SHA256, initSPI, respSPI, encrRI, integRI, encrIR, integIR, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,11 +125,11 @@ func TestDataPlaneLoopbackV6(t *testing.T) {
 	integRI := bytes.Repeat([]byte{0x04}, 32)
 
 	const initSPI, respSPI = 0x1111, 0x2222
-	initSA, err := esp.NewSA(respSPI, initSPI, encrIR, integIR, encrRI, integRI, 64)
+	initSA, err := esp.NewSA(esp.SuiteAESCBC256SHA256, respSPI, initSPI, encrIR, integIR, encrRI, integRI, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
-	respSA, err := esp.NewSA(initSPI, respSPI, encrRI, integRI, encrIR, integIR, 64)
+	respSA, err := esp.NewSA(esp.SuiteAESCBC256SHA256, initSPI, respSPI, encrRI, integRI, encrIR, integIR, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,8 +243,8 @@ func TestDataPlaneRekeyCutover(t *testing.T) {
 	encRI, intRI := mkKeys(0x03)
 	const initSPI, respSPI = 0x1111, 0x2222
 
-	initSA, _ := esp.NewSA(respSPI, initSPI, encIR, intIR, encRI, intRI, 64)
-	respSA, _ := esp.NewSA(initSPI, respSPI, encRI, intRI, encIR, intIR, 64)
+	initSA, _ := esp.NewSA(esp.SuiteAESCBC256SHA256, respSPI, initSPI, encIR, intIR, encRI, intRI, 64)
+	respSA, _ := esp.NewSA(esp.SuiteAESCBC256SHA256, initSPI, respSPI, encRI, intRI, encIR, intIR, 64)
 
 	var initReg, respReg atomic.Pointer[map[uint32]*esp.SA]
 	initReg.Store(&map[uint32]*esp.SA{initSPI: initSA})
@@ -314,8 +314,8 @@ func TestDataPlaneRekeyCutover(t *testing.T) {
 	nEncIR, nIntIR := mkKeys(0x21)
 	nEncRI, nIntRI := mkKeys(0x23)
 	const initSPI2, respSPI2 = 0x3333, 0x4444
-	newInitSA, _ := esp.NewSA(respSPI2, initSPI2, nEncIR, nIntIR, nEncRI, nIntRI, 64)
-	newRespSA, _ := esp.NewSA(initSPI2, respSPI2, nEncRI, nIntRI, nEncIR, nIntIR, 64)
+	newInitSA, _ := esp.NewSA(esp.SuiteAESCBC256SHA256, respSPI2, initSPI2, nEncIR, nIntIR, nEncRI, nIntRI, 64)
+	newRespSA, _ := esp.NewSA(esp.SuiteAESCBC256SHA256, initSPI2, respSPI2, nEncRI, nIntRI, nEncIR, nIntIR, 64)
 
 	initReg.Store(&map[uint32]*esp.SA{initSPI: initSA, initSPI2: newInitSA})
 	respReg.Store(&map[uint32]*esp.SA{respSPI: respSA, respSPI2: newRespSA})
@@ -333,7 +333,7 @@ func TestTunnelOutboundSeq(t *testing.T) {
 	integIR := bytes.Repeat([]byte{0x02}, 32)
 	encrRI := bytes.Repeat([]byte{0x03}, 32)
 	integRI := bytes.Repeat([]byte{0x04}, 32)
-	sa, err := esp.NewSA(0x2222, 0x1111, encrIR, integIR, encrRI, integRI, 64)
+	sa, err := esp.NewSA(esp.SuiteAESCBC256SHA256, 0x2222, 0x1111, encrIR, integIR, encrRI, integRI, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func newBareClient(t *testing.T, ip string) *Client {
 	integIR := bytes.Repeat([]byte{0x02}, 32)
 	encrRI := bytes.Repeat([]byte{0x03}, 32)
 	integRI := bytes.Repeat([]byte{0x04}, 32)
-	sa, err := esp.NewSA(0x2222, 0x1111, encrIR, integIR, encrRI, integRI, 64)
+	sa, err := esp.NewSA(esp.SuiteAESCBC256SHA256, 0x2222, 0x1111, encrIR, integIR, encrRI, integRI, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,11 +454,11 @@ func TestRemoveInboundIdentityGuard(t *testing.T) {
 	c := newClient(Config{Logger: discardLogger()})
 	const spi = 0x10
 	key := bytes.Repeat([]byte{1}, 32)
-	saOld, err := esp.NewSA(1, spi, key, key, key, key, 64)
+	saOld, err := esp.NewSA(esp.SuiteAESCBC256SHA256, 1, spi, key, key, key, key, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
-	saNew, err := esp.NewSA(2, spi, key, key, key, key, 64)
+	saNew, err := esp.NewSA(esp.SuiteAESCBC256SHA256, 2, spi, key, key, key, key, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -503,5 +503,78 @@ func TestDNSAccessorsReturnCopies(t *testing.T) {
 	got6[0] = netip.MustParseAddr("2606:4700:4700::1111")
 	if c.DNS6()[0] != v6 {
 		t.Fatalf("DNS6() exposed a mutable internal slice: second call = %v, want %v", c.DNS6()[0], v6)
+	}
+}
+
+// TestInstallChildSAAEADSuite pins that ChildSAUpdate.Suite reaches the ESP
+// layer: installing a rekeyed AES-GCM-256 Child SA must produce an outbound SA
+// whose packets a partner keyed with the same 36-byte (key+salt) material
+// decrypts, and an inbound registry entry that decrypts the partner's packets.
+func TestInstallChildSAAEADSuite(t *testing.T) {
+	initConn, respConn := transport.MemoryPair()
+	t.Cleanup(func() { initConn.Close(); respConn.Close() })
+	c := newClient(Config{Logger: discardLogger(), ReplayWindow: 64})
+	send := func(ctx context.Context, pkt []byte) error { return initConn.Send(ctx, pkt) }
+
+	// Seed the data plane with the first (CBC) Child SA, as after IKE_AUTH.
+	oldKey := bytes.Repeat([]byte{0x01}, 32)
+	oldSA, err := esp.NewSA(esp.SuiteAESCBC256SHA256, 2, 1, oldKey, oldKey, oldKey, oldKey, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.resetInbound(1, oldSA)
+	c.tun = tunnel.New(oldSA, send, tunConfig(netip.MustParseAddr("10.6.0.1"), netip.MustParseAddr("255.255.255.0")))
+	t.Cleanup(func() { c.tun.Close() })
+	t.Cleanup(c.stopGraceTimers)
+
+	// Rekey switches the suite to AES-GCM-256 (36-byte key+salt, no integ key).
+	keyIR := bytes.Repeat([]byte{0x11}, 36)
+	keyRI := bytes.Repeat([]byte{0x22}, 36)
+	c.InstallChildSA(session.ChildSAUpdate{
+		NewInSPI: 0xAAAA, NewOutSPI: 0xBBBB, OldInSPI: 1,
+		Suite:   esp.SuiteAESGCM256,
+		OutEncr: keyIR, InEncr: keyRI,
+	})
+
+	partner, err := esp.NewSA(esp.SuiteAESGCM256, 0xAAAA, 0xBBBB, keyRI, nil, keyIR, nil, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Outbound: a tunnel write now leaves under the swapped-in GCM SA.
+	inner := append([]byte{0x45}, bytes.Repeat([]byte{0xAB}, 27)...)
+	if _, err := c.tun.TunnelConn().Write(inner); err != nil {
+		t.Fatalf("tunnel write: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	raw, err := respConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := partner.Decrypt(raw)
+	if err != nil {
+		t.Fatalf("partner could not decrypt our GCM packet: %v", err)
+	}
+	if !bytes.Equal(got, inner) {
+		t.Fatal("outbound GCM round-trip mismatch")
+	}
+
+	// Inbound: the registry entry under the new SPI decrypts partner packets.
+	inSA := c.lookupInbound(0xAAAA)
+	if inSA == nil {
+		t.Fatal("new inbound GCM SA not registered")
+	}
+	inner2 := append([]byte{0x45}, bytes.Repeat([]byte{0xCD}, 19)...)
+	pkt, err := partner.Encrypt(inner2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := inSA.Decrypt(pkt)
+	if err != nil {
+		t.Fatalf("inbound GCM decrypt: %v", err)
+	}
+	if !bytes.Equal(got2, inner2) {
+		t.Fatal("inbound GCM round-trip mismatch")
 	}
 }

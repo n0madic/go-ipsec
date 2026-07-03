@@ -12,6 +12,7 @@ import (
 
 	"github.com/n0madic/go-ipsec/internal/auth"
 	"github.com/n0madic/go-ipsec/internal/eap"
+	"github.com/n0madic/go-ipsec/internal/esp"
 	"github.com/n0madic/go-ipsec/internal/ikemsg"
 	"github.com/n0madic/go-ipsec/internal/ikesa"
 )
@@ -24,6 +25,7 @@ const maxEAPRounds = 32
 type ChildSA struct {
 	InitiatorSPI uint32 // our SPI (responder sends to it)
 	ResponderSPI uint32 // responder SPI (we send to it)
+	Suite        esp.Suite
 	Keys         ikesa.ChildKeys
 }
 
@@ -75,14 +77,15 @@ func (s *Session) ikeAuthPSK(ctx context.Context) error {
 		return err
 	}
 
-	// IDi, the shared-key AUTH, the ESP proposal, full-tunnel selectors and the CFG
-	// request — everything the EAP path spreads across several messages, in one
-	// request because PSK needs no EAP round-trip. The child proposal still
-	// advertises both DH groups for a strict-PFS server (see ikeAuthEAP).
+	// IDi, the shared-key AUTH, the ESP proposals (one per enabled suite),
+	// full-tunnel selectors and the CFG request — everything the EAP path
+	// spreads across several messages, in one request because PSK needs no EAP
+	// round-trip. The child proposals still advertise both DH groups for a
+	// strict-PFS server (see ikeAuthEAP).
 	first := ikemsg.Payloads{
 		&ikemsg.IDiPayload{IDType: ikemsg.IDType(s.cfg.LocalID.Type), Data: s.cfg.LocalID.Data},
 		&ikemsg.AuthPayload{Method: auth.MethodSharedKeyMIC, Data: s.computeInitiatorAuth(s.cfg.PSK)},
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalPFS(1, spi, preferredDHGroups...)}},
+		&ikemsg.SAPayload{Proposals: buildESPProposals(spi, s.enabledESPSuites(), preferredDHGroups...)},
 	}
 	appendTrafficSelectors(&first, s.cfg.RequestIPv6)
 	buildCPRequest(&first, s.cfg.RequestIPv6)
@@ -114,10 +117,11 @@ func (s *Session) ikeAuthEAP(ctx context.Context) error {
 	// strict-PFS server (esp=...-curve25519!) requires the child PROPOSAL to
 	// advertise the DH group so it can narrow to its required group. Offer both
 	// (x25519 preferred, MODP-2048 fallback); a server without strict PFS ignores
-	// the unused DH transforms.
+	// the unused DH transforms. One proposal per enabled ESP suite, in our
+	// preference order.
 	first := ikemsg.Payloads{
 		&ikemsg.IDiPayload{IDType: ikemsg.IDType(s.cfg.LocalID.Type), Data: s.cfg.LocalID.Data},
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalPFS(1, spi, preferredDHGroups...)}},
+		&ikemsg.SAPayload{Proposals: buildESPProposals(spi, s.enabledESPSuites(), preferredDHGroups...)},
 	}
 	appendTrafficSelectors(&first, s.cfg.RequestIPv6)
 	buildCPRequest(&first, s.cfg.RequestIPv6)
@@ -306,21 +310,30 @@ func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, secret []byt
 		return errors.New("session: responder AUTH verification failed")
 	}
 
-	if saP == nil || len(saP.Proposals) == 0 || !isESPSelection(saP.Proposals[0]) {
-		return errors.New("session: responder selected an unsupported or ambiguous ESP proposal")
+	if saP == nil || len(saP.Proposals) == 0 {
+		return errors.New("session: final IKE_AUTH missing the responder's ESP proposal")
+	}
+	prop := saP.Proposals[0]
+	suite, ok := selectedESPSuite(prop, s.enabledESPSuites())
+	if !ok {
+		return fmt.Errorf("session: responder selected an unsupported or ambiguous ESP proposal (%s)", describeProposals(saP))
+	}
+	if len(prop.SPI) != 4 {
+		return fmt.Errorf("session: responder selected an ESP proposal with invalid SPI length %d (%s)", len(prop.SPI), describeProposals(saP))
 	}
 	// The responder MAY narrow our full-tunnel selectors (RFC 7296 §2.9). We only
 	// route full-tunnel, so a narrowed selector means traffic outside it is dropped
 	// by the gateway with no other client-side signal — surface it.
 	s.warnNarrowedTS("IKE_AUTH", tsi, tsr)
-	respSPI := saP.Proposals[0].SPI
+	respSPI := prop.SPI
 	if len(respSPI) != 4 {
 		return fmt.Errorf("session: responder ESP SPI length %d", len(respSPI))
 	}
 	s.child = &ChildSA{
 		InitiatorSPI: s.childInitiatorSPI,
 		ResponderSPI: binary.BigEndian.Uint32(respSPI),
-		Keys:         s.ikeSA.DeriveChildKeys(s.nonceI, s.nonceR, espEncrKeyLen, espIntegKeyLen),
+		Suite:        suite.id,
+		Keys:         s.ikeSA.DeriveChildKeys(s.nonceI, s.nonceR, suite.encrKeyLen, suite.integKeyLen),
 	}
 	if cp != nil {
 		s.assigned = parseCPReply(cp)
@@ -328,6 +341,7 @@ func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, secret []byt
 	s.established = true
 	s.log.Info("IKE_AUTH established",
 		"assignedIP", s.assigned.IP,
+		"espSuite", suite.name(),
 		"childSPIout", fmt.Sprintf("%08x", s.child.ResponderSPI))
 	return nil
 }

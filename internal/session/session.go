@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/n0madic/go-ipsec/internal/esp"
 	"github.com/n0madic/go-ipsec/internal/ikemsg"
 	"github.com/n0madic/go-ipsec/internal/ikesa"
 	"github.com/n0madic/go-ipsec/internal/secretmem"
@@ -55,6 +56,11 @@ type Config struct {
 	ReplayWindow     uint32
 	RekeyMaxPackets  uint32
 	ChildSAPFS       bool
+
+	// ESPSuites restricts and orders the ESP suites offered for Child SAs, in
+	// preference order. nil/empty offers the full built-in table. Resolved from
+	// ipsec.Config.ESPCipherSuites (which validates the values).
+	ESPSuites []esp.Suite
 
 	// RequestIPv6 asks the responder for an inner IPv6 address (CFG) and offers
 	// IPv6 traffic selectors. Resolved from ipsec.Config.RequestIPv6; a v4-only

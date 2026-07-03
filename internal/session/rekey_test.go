@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/n0madic/go-ipsec/internal/esp"
 	"github.com/n0madic/go-ipsec/internal/ikemsg"
 	"github.com/n0madic/go-ipsec/internal/ikesa"
 )
@@ -32,7 +33,7 @@ func serverChildRekey(t *testing.T, respS *Session, msgID uint32, oldSPI, newSPI
 	t.Helper()
 	inner := ikemsg.Payloads{
 		&ikemsg.NotifyPayload{Protocol: ikemsg.ProtocolESP, Type: ikemsg.NotifyRekeySA, SPI: oldSPI},
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, newSPI)}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalCBC(1, newSPI)}},
 		&ikemsg.NoncePayload{Data: ni},
 	}
 	appendTrafficSelectors(&inner, false)
@@ -222,7 +223,7 @@ func TestChildRekeyResponderEchoesNarrowedTS(t *testing.T) {
 	}}
 	inner := ikemsg.Payloads{
 		&ikemsg.NotifyPayload{Protocol: ikemsg.ProtocolESP, Type: ikemsg.NotifyRekeySA, SPI: []byte{0, 0, 0x22, 0x22}},
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, []byte{0xAB, 0xCD, 0xEF, 0x08})}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalCBC(1, []byte{0xAB, 0xCD, 0xEF, 0x08})}},
 		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xC2}, nonceLen)},
 		&ikemsg.TSiPayload{Selectors: narrowed},
 		&ikemsg.TSrPayload{Selectors: narrowed},
@@ -696,7 +697,7 @@ func TestChildRekeyErrorDoesNotRearmDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, []byte{0xAB, 0xCD, 0xEF, 0x60})}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalCBC(1, []byte{0xAB, 0xCD, 0xEF, 0x60})}},
 		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xE3}, nonceLen)},
 		&ikemsg.KEPayload{Group: ikemsg.DH_MODP2048, Data: dh.Public},
 	}
@@ -730,7 +731,7 @@ func TestChildRekeyKEGroupVsProposalMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Proposal advertises ONLY group 19, but the KE claims group 14.
-	mp := buildESPProposal(1, []byte{0xAB, 0xCD, 0xEF, 0x50})
+	mp := buildESPProposalCBC(1, []byte{0xAB, 0xCD, 0xEF, 0x50})
 	mp.Transforms = append(mp.Transforms, ikemsg.Transform{Type: ikemsg.TransformDH, ID: 19})
 	inner := ikemsg.Payloads{
 		&ikemsg.NotifyPayload{Protocol: ikemsg.ProtocolESP, Type: ikemsg.NotifyRekeySA, SPI: []byte{0, 0, 0x22, 0x22}},
@@ -813,7 +814,7 @@ func TestReestablishGraceRemovesOldInbound(t *testing.T) {
 
 	// Responder answers the re-establishment (non-PFS).
 	resp := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, []byte{0, 0, 0x33, 0x33})}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalCBC(1, []byte{0, 0, 0x33, 0x33})}},
 		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xE2}, nonceLen)},
 	}
 	appendTrafficSelectors(&resp, false)
@@ -851,8 +852,8 @@ func buildESPProposalMultiOption(number uint8, spi []byte) ikemsg.Proposal {
 	return ikemsg.Proposal{
 		Number: number, Protocol: ikemsg.ProtocolESP, SPI: append([]byte(nil), spi...),
 		Transforms: []ikemsg.Transform{
-			{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_AES_CBC, KeyLength: keyLenAES256},
-			{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_AES_CBC, KeyLength: 128},
+			{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_AES_CBC, KeyLength: keyLenAES256, HasKeyLength: true},
+			{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_AES_CBC, KeyLength: 128, HasKeyLength: true},
 			{Type: ikemsg.TransformInteg, ID: ikemsg.AUTH_HMAC_SHA2_256_128},
 			{Type: ikemsg.TransformESN, ID: ikemsg.ESN_NONE},
 			{Type: ikemsg.TransformESN, ID: 1 /* ESN enabled */},
@@ -925,7 +926,7 @@ func buildServerChildPFSRekey(t *testing.T, respS *Session, msgID uint32, ni, ne
 	t.Helper()
 	inner := ikemsg.Payloads{
 		&ikemsg.NotifyPayload{Protocol: ikemsg.ProtocolESP, Type: ikemsg.NotifyRekeySA, SPI: []byte{0, 0, 0x22, 0x22}},
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalPFS(1, newSPI, propGroup)}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalCBC(1, newSPI, propGroup)}},
 		&ikemsg.NoncePayload{Data: ni},
 		&ikemsg.KEPayload{Group: keGroup, Data: dhPub},
 	}
@@ -1151,7 +1152,7 @@ func TestChildRekeyInitiatorPFSRejectsDHWithoutKE(t *testing.T) {
 
 	// Contradictory response: a DH-group transform selected, but NO KE payload.
 	resp := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalPFS(1, []byte{0xAB, 0xCD, 0xEF, 0x31}, ikemsg.DH_MODP2048)}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalCBC(1, []byte{0xAB, 0xCD, 0xEF, 0x31}, ikemsg.DH_MODP2048)}},
 		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xE1}, nonceLen)},
 	}
 	appendTrafficSelectors(&resp, false)
@@ -1210,7 +1211,7 @@ func TestChildRekeyInitiatorPFSFallbackToNonPFS(t *testing.T) {
 	// Responder narrows PFS away: a valid non-PFS response (no DH group, no KE).
 	respNr := bytes.Repeat([]byte{0xE0}, nonceLen)
 	resp := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, []byte{0xAB, 0xCD, 0xEF, 0x30})}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalCBC(1, []byte{0xAB, 0xCD, 0xEF, 0x30})}},
 		&ikemsg.NoncePayload{Data: respNr},
 	}
 	appendTrafficSelectors(&resp, false)
@@ -1542,6 +1543,307 @@ func beUint32(b []byte) uint32 {
 		return 0
 	}
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+// TestChildRekeyOffersFullSuiteTable: a Child rekey we initiate re-offers the
+// whole enabled suite table — one proposal per suite, numbered 1..n in our
+// preference order, AEAD proposals without INTEG.
+func TestChildRekeyOffersFullSuiteTable(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	initS.SetDataPlane(&fakeDataPlane{})
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+	if err := initS.initiateChildRekey(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	reqRaw, err := respConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, inner, _, err := respS.decodeIKE(reqRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saP *ikemsg.SAPayload
+	for _, p := range inner {
+		if v, ok := p.(*ikemsg.SAPayload); ok {
+			saP = v
+		}
+	}
+	if saP == nil || len(saP.Proposals) != len(espSuites) {
+		t.Fatalf("rekey offer carries %d proposals, want %d", len(saP.Proposals), len(espSuites))
+	}
+	for i, prop := range saP.Proposals {
+		suite := espSuites[i]
+		if prop.Number != uint8(i+1) {
+			t.Fatalf("proposal %d numbered %d, want %d", i, prop.Number, i+1)
+		}
+		if !suiteMatchesProposal(suite, prop) {
+			t.Fatalf("proposal %d does not carry suite %s", i, suite.name())
+		}
+		if suite.aead() && len(prop.ByType(ikemsg.TransformInteg)) != 0 {
+			t.Fatalf("AEAD proposal %d carries an INTEG transform", i)
+		}
+	}
+}
+
+// TestChildRekeySuiteSwitch drives a we-initiated rekey where the responder
+// narrows the multi-suite offer to ChaCha20-Poly1305 while the live Child SA
+// runs CBC: the install must carry the NEW suite, AEAD key lengths (36/0) and
+// the initiator key orientation (Out = I→R).
+func TestChildRekeySuiteSwitch(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222, Suite: esp.SuiteAESCBC256SHA256}
+	initDP := &fakeDataPlane{}
+	initS.SetDataPlane(initDP)
+	chacha := mustSuite(t, esp.SuiteChaCha20Poly1305)
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+	if err := initS.initiateChildRekey(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	initNi := append([]byte(nil), initS.pending.child.ni...)
+	msgID := initS.pending.msgID
+	if _, err := respConn.Recv(ctx); err != nil { // drain our request
+		t.Fatal(err)
+	}
+
+	// Responder selects ChaCha (proposal number 2 in our offer).
+	respNr := bytes.Repeat([]byte{0xEA}, nonceLen)
+	resp := ikemsg.Payloads{
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalForSuite(2, chacha, []byte{0xAB, 0xCD, 0xEF, 0x70})}},
+		&ikemsg.NoncePayload{Data: respNr},
+	}
+	appendTrafficSelectors(&resp, false)
+	respRaw, err := encodeSKWith(respS.ikeSA, respS.initiatorSPI, respS.responderSPI,
+		ikemsg.ExchangeCreateChildSA, ikemsg.FlagResponse, msgID, resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exit := initS.handleInbound(ctx, respRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+
+	if len(initDP.updates) != 1 {
+		t.Fatalf("expected 1 install, got %d", len(initDP.updates))
+	}
+	u := initDP.updates[0]
+	if u.Suite != esp.SuiteChaCha20Poly1305 {
+		t.Fatalf("installed suite %v, want ChaCha20-Poly1305", u.Suite)
+	}
+	if len(u.OutEncr) != chacha.encrKeyLen || len(u.OutInteg) != chacha.integKeyLen {
+		t.Fatalf("key lengths %d/%d, want %d/%d", len(u.OutEncr), len(u.OutInteg), chacha.encrKeyLen, chacha.integKeyLen)
+	}
+	// We initiated → outbound is the I→R half of KEYMAT.
+	want := initS.ikeSA.DeriveChildKeys(initNi, respNr, chacha.encrKeyLen, chacha.integKeyLen)
+	if !bytes.Equal(u.OutEncr, want.EncrIR) || !bytes.Equal(u.InEncr, want.EncrRI) {
+		t.Fatal("initiator key orientation incorrect for the switched suite")
+	}
+	if initS.child.Suite != esp.SuiteChaCha20Poly1305 {
+		t.Fatalf("session child suite %v, want ChaCha20-Poly1305", initS.child.Suite)
+	}
+}
+
+// TestChildRekeyResponseAmbiguousRejected is the F3 tightening: a rekey
+// response whose proposal still carries two ENCR alternatives is not a valid
+// selection — with three suites offered the KEYMAT lengths would be undefined —
+// so completeChildRekey must reject it without installing.
+func TestChildRekeyResponseAmbiguousRejected(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	initDP := &fakeDataPlane{}
+	initS.SetDataPlane(initDP)
+	gcm := mustSuite(t, esp.SuiteAESGCM256)
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+	if err := initS.initiateChildRekey(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	msgID := initS.pending.msgID
+	if _, err := respConn.Recv(ctx); err != nil { // drain our request
+		t.Fatal(err)
+	}
+
+	ambiguous := buildESPProposalForSuite(1, gcm, []byte{0xAB, 0xCD, 0xEF, 0x71})
+	ambiguous.Transforms = append(ambiguous.Transforms,
+		ikemsg.Transform{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_CHACHA20_POLY1305})
+	resp := ikemsg.Payloads{
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{ambiguous}},
+		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xEB}, nonceLen)},
+	}
+	appendTrafficSelectors(&resp, false)
+	respRaw, err := encodeSKWith(respS.ikeSA, respS.initiatorSPI, respS.responderSPI,
+		ikemsg.ExchangeCreateChildSA, ikemsg.FlagResponse, msgID, resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exit := initS.handleInbound(ctx, respRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if len(initDP.updates) != 0 {
+		t.Fatalf("ambiguous rekey response was installed: updates=%d", len(initDP.updates))
+	}
+}
+
+// TestServerChildRekeyCombinedAEADProposal: a server-initiated rekey offering a
+// strongSwan-style combined AEAD proposal (GCM-256 and GCM-128 alternatives,
+// both ESN modes) ahead of a CBC proposal must be answered with a single
+// narrowed proposal built from the SELECTED suite — GCM-256, echoing the
+// proposal number, no INTEG transform — and installed with the responder key
+// orientation (Out = R→I) at the AEAD lengths.
+func TestServerChildRekeyCombinedAEADProposal(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	initDP := &fakeDataPlane{}
+	initS.SetDataPlane(initDP)
+	gcm := mustSuite(t, esp.SuiteAESGCM256)
+
+	combined := ikemsg.Proposal{
+		Number: 1, Protocol: ikemsg.ProtocolESP, SPI: []byte{0xAB, 0xCD, 0xEF, 0x81},
+		Transforms: []ikemsg.Transform{
+			{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_AES_GCM_16, KeyLength: 256, HasKeyLength: true},
+			{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_AES_GCM_16, KeyLength: 128, HasKeyLength: true},
+			{Type: ikemsg.TransformESN, ID: ikemsg.ESN_NONE},
+			{Type: ikemsg.TransformESN, ID: 1 /* ESN enabled */},
+		},
+	}
+	serverNi := bytes.Repeat([]byte{0xDD}, nonceLen)
+	inner := ikemsg.Payloads{
+		&ikemsg.NotifyPayload{Protocol: ikemsg.ProtocolESP, Type: ikemsg.NotifyRekeySA, SPI: []byte{0, 0, 0x22, 0x22}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{combined, buildESPProposalMultiOption(2, []byte{0xAB, 0xCD, 0xEF, 0x81})}},
+		&ikemsg.NoncePayload{Data: serverNi},
+	}
+	appendTrafficSelectors(&inner, false)
+	reqRaw, err := encodeSKWith(respS.ikeSA, respS.initiatorSPI, respS.responderSPI,
+		ikemsg.ExchangeCreateChildSA, 0, 5, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+	if exit := initS.handleInbound(ctx, reqRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if len(initDP.updates) != 1 {
+		t.Fatalf("combined AEAD offer not accepted: installs=%d", len(initDP.updates))
+	}
+	u := initDP.updates[0]
+	if u.Suite != esp.SuiteAESGCM256 {
+		t.Fatalf("installed suite %v, want AES-GCM-256", u.Suite)
+	}
+	if len(u.OutEncr) != gcm.encrKeyLen || len(u.OutInteg) != 0 {
+		t.Fatalf("key lengths %d/%d, want %d/0", len(u.OutEncr), len(u.OutInteg), gcm.encrKeyLen)
+	}
+
+	respRaw, err := respConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, respInner, _, err := respS.decodeIKE(respRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saR *ikemsg.SAPayload
+	var ourNr []byte
+	for _, p := range respInner {
+		switch v := p.(type) {
+		case *ikemsg.SAPayload:
+			saR = v
+		case *ikemsg.NoncePayload:
+			ourNr = v.Data
+		}
+	}
+	if saR == nil || len(saR.Proposals) != 1 {
+		t.Fatal("response missing a single narrowed SA proposal")
+	}
+	prop := saR.Proposals[0]
+	if prop.Number != 1 {
+		t.Fatalf("response echoed proposal number %d, want 1", prop.Number)
+	}
+	encrs := prop.ByType(ikemsg.TransformEncr)
+	if len(encrs) != 1 || encrs[0].ID != ikemsg.ENCR_AES_GCM_16 || encrs[0].KeyLength != 256 {
+		t.Fatalf("response ENCR not narrowed to GCM-256: %+v", encrs)
+	}
+	if len(prop.ByType(ikemsg.TransformInteg)) != 0 {
+		t.Fatal("narrowed AEAD response carries an INTEG transform")
+	}
+	// Server initiated → our outbound is the R→I half of KEYMAT.
+	want := initS.ikeSA.DeriveChildKeys(serverNi, ourNr, gcm.encrKeyLen, gcm.integKeyLen)
+	if !bytes.Equal(u.OutEncr, want.EncrRI) || !bytes.Equal(u.InEncr, want.EncrIR) {
+		t.Fatal("responder key orientation incorrect for the AEAD suite")
+	}
+}
+
+// TestServerChildRekeyRequireGroupFallsBack: a PFS rekey whose KE group is
+// advertised only by the CBC proposal must skip the (more preferred) GCM
+// proposal that lacks the group and select CBC — the DH exchange may only run
+// against a proposal that offered the group.
+func TestServerChildRekeyRequireGroupFallsBack(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	initDP := &fakeDataPlane{}
+	initS.SetDataPlane(initDP)
+	gcm := mustSuite(t, esp.SuiteAESGCM256)
+
+	serverDH, err := ikesa.NewDH(ikemsg.DH_MODP2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := ikemsg.Payloads{
+		&ikemsg.NotifyPayload{Protocol: ikemsg.ProtocolESP, Type: ikemsg.NotifyRekeySA, SPI: []byte{0, 0, 0x22, 0x22}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{
+			buildESPProposalForSuite(1, gcm, []byte{0xAB, 0xCD, 0xEF, 0x82}), // no DH group
+			buildESPProposalCBC(2, []byte{0xAB, 0xCD, 0xEF, 0x82}, ikemsg.DH_MODP2048),
+		}},
+		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xDE}, nonceLen)},
+		&ikemsg.KEPayload{Group: ikemsg.DH_MODP2048, Data: serverDH.Public},
+	}
+	appendTrafficSelectors(&inner, false)
+	reqRaw, err := encodeSKWith(respS.ikeSA, respS.initiatorSPI, respS.responderSPI,
+		ikemsg.ExchangeCreateChildSA, 0, 5, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+	if exit := initS.handleInbound(ctx, reqRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if len(initDP.updates) != 1 {
+		t.Fatalf("group-constrained PFS rekey not accepted: installs=%d", len(initDP.updates))
+	}
+	u := initDP.updates[0]
+	if u.Suite != esp.SuiteAESCBC256SHA256 {
+		t.Fatalf("installed suite %v, want CBC (the only proposal advertising the KE group)", u.Suite)
+	}
+	// Our narrowed response must echo the CBC proposal's number (2) and its group.
+	respRaw, err := respConn.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, respInner, _, err := respS.decodeIKE(respRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range respInner {
+		if v, ok := p.(*ikemsg.SAPayload); ok {
+			if len(v.Proposals) != 1 || v.Proposals[0].Number != 2 {
+				t.Fatalf("response did not echo the CBC proposal number: %+v", v.Proposals)
+			}
+			if !proposalHasDHGroup(v.Proposals[0], ikemsg.DH_MODP2048) {
+				t.Fatal("response proposal lost the DH group")
+			}
+		}
+	}
+	if !initS.childPFS || initS.childPFSGroup != ikemsg.DH_MODP2048 {
+		t.Fatal("PFS group not latched from the group-constrained rekey")
+	}
 }
 
 // TestRekeyCompletionClearsQueuedReestablish: a peer DELETE of the live Child

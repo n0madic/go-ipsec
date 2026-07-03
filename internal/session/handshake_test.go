@@ -20,6 +20,7 @@ import (
 
 	iauth "github.com/n0madic/go-ipsec/internal/auth"
 	"github.com/n0madic/go-ipsec/internal/eap"
+	"github.com/n0madic/go-ipsec/internal/esp"
 	"github.com/n0madic/go-ipsec/internal/ikemsg"
 	"github.com/n0madic/go-ipsec/internal/ikesa"
 	"github.com/n0madic/go-ipsec/internal/transport"
@@ -28,10 +29,19 @@ import (
 
 // TestOfflineHandshake drives the full initiator state machine
 // (IKE_SA_INIT + IKE_AUTH + EAP-MSCHAPv2 + Child SA) against a cooperating
-// in-memory responder built from the same primitives. It proves the state
-// machine reaches "established" and that both ends derive identical Child SA
-// keys — the Phase 1 offline gate, with zero live dials.
+// in-memory responder built from the same primitives, once per negotiable ESP
+// suite (the responder narrows the client's three-proposal offer to it). It
+// proves the state machine reaches "established", records the selected suite,
+// and that both ends derive identical Child SA keys of that suite's lengths —
+// the Phase 1 offline gate, with zero live dials.
 func TestOfflineHandshake(t *testing.T) {
+	for _, id := range []esp.Suite{esp.SuiteAESGCM256, esp.SuiteChaCha20Poly1305, esp.SuiteAESCBC256SHA256} {
+		suite := mustSuite(t, id)
+		t.Run(suite.name(), func(t *testing.T) { testOfflineHandshake(t, suite) })
+	}
+}
+
+func testOfflineHandshake(t *testing.T, suite espSuite) {
 	const username, password = "User", "clientPass"
 	initConn, respConn := transport.MemoryPair()
 
@@ -56,7 +66,7 @@ func TestOfflineHandshake(t *testing.T) {
 
 	respDone := make(chan *responderResult, 1)
 	go func() {
-		res := runResponder(t, respConn, username, password, leaf, leafKey)
+		res := runResponder(t, respConn, username, password, leaf, leafKey, suite)
 		respDone <- res
 	}()
 
@@ -87,10 +97,17 @@ func TestOfflineHandshake(t *testing.T) {
 	if got := initSess.Assigned().IP6; got != wantIP6 {
 		t.Fatalf("assigned IP6 = %v, want %v", got, wantIP6)
 	}
-	// Child SA SPIs and keys must agree across both ends.
+	// Child SA suite, SPIs, key lengths and keys must agree across both ends.
 	child := initSess.Child()
 	if child == nil {
 		t.Fatal("no child SA installed")
+	}
+	if child.Suite != suite.id {
+		t.Fatalf("negotiated suite = %v, want %v", child.Suite, suite.id)
+	}
+	if len(child.Keys.EncrIR) != suite.encrKeyLen || len(child.Keys.IntegIR) != suite.integKeyLen {
+		t.Fatalf("key lengths %d/%d, want %d/%d",
+			len(child.Keys.EncrIR), len(child.Keys.IntegIR), suite.encrKeyLen, suite.integKeyLen)
 	}
 	if child.ResponderSPI != res.childResponderSPI {
 		t.Fatalf("responder SPI mismatch: %08x vs %08x", child.ResponderSPI, res.childResponderSPI)
@@ -107,9 +124,10 @@ type responderResult struct {
 	childKeys         ikesa.ChildKeys
 }
 
-// runResponder implements the responder half of the handshake. It uses a
-// Responder-role Session purely for its encodeSK/decodeSK helpers.
-func runResponder(t *testing.T, conn transport.Conn, username, password string, leaf *x509.Certificate, leafKey *rsa.PrivateKey) *responderResult {
+// runResponder implements the responder half of the handshake, narrowing the
+// client's multi-suite ESP offer to the given suite. It uses a Responder-role
+// Session purely for its encodeSK/decodeSK helpers.
+func runResponder(t *testing.T, conn transport.Conn, username, password string, leaf *x509.Certificate, leafKey *rsa.PrivateKey, suite espSuite) *responderResult {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -299,16 +317,16 @@ func runResponder(t *testing.T, conn transport.Conn, username, password string, 
 		return fail(errFail("initiator MSK AUTH mismatch"))
 	}
 
-	// Build final response.
+	// Build final response, narrowed to the requested suite.
 	var childSPIBuf [4]byte
 	rand.Read(childSPIBuf[:])
 	res.childResponderSPI = binary.BigEndian.Uint32(childSPIBuf[:])
-	res.childKeys = rs.ikeSA.DeriveChildKeys(ni, nr, espEncrKeyLen, espIntegKeyLen)
+	res.childKeys = rs.ikeSA.DeriveChildKeys(ni, nr, suite.encrKeyLen, suite.integKeyLen)
 
 	respAuth := iauth.SharedSecretAuth(rs.ikeSA.PRF, msk, respSigned)
 	m10 := ikemsg.Payloads{
 		&ikemsg.AuthPayload{Method: iauth.MethodSharedKeyMIC, Data: respAuth},
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, childSPIBuf[:])}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalForSuite(1, suite, childSPIBuf[:])}},
 	}
 	appendTrafficSelectors(&m10, true)
 	ip := netip.MustParseAddr("10.10.0.42").As4()
@@ -355,7 +373,7 @@ func TestOfflineHandshakePSK(t *testing.T) {
 	initSess.conn = initConn
 
 	respDone := make(chan *responderResult, 1)
-	go func() { respDone <- runResponderPSK(respConn, psk) }()
+	go func() { respDone <- runResponderPSK(respConn, psk, cbcSuite(), nil) }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -412,7 +430,7 @@ func TestOfflineHandshakePSKWrongKey(t *testing.T) {
 	initSess.conn = initConn
 
 	respDone := make(chan *responderResult, 1)
-	go func() { respDone <- runResponderPSK(respConn, []byte("server-key")) }()
+	go func() { respDone <- runResponderPSK(respConn, []byte("server-key"), cbcSuite(), nil) }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -494,11 +512,19 @@ func respondSAInit(ctx context.Context, conn transport.Conn, rs *Session, nr []b
 	return raw1, realMessage2, ni, nil
 }
 
+// cbcSuite returns the AES-CBC-256+HMAC suite row for scripted responders that
+// run outside a *testing.T context (goroutines).
+func cbcSuite() espSuite {
+	s, _ := espSuiteByID(esp.SuiteAESCBC256SHA256)
+	return s
+}
+
 // runResponderPSK implements the PSK responder half: IKE_SA_INIT followed by a
 // single IKE_AUTH round-trip that verifies the initiator's shared-key AUTH and
-// replies with IDr, the responder's shared-key AUTH, SAr2, traffic selectors and
+// replies with IDr, the responder's shared-key AUTH, SAr2 (narrowed to suite,
+// optionally corrupted by mangle for negative tests), traffic selectors and
 // the CFG reply. A PSK mismatch is surfaced as an error in the returned result.
-func runResponderPSK(conn transport.Conn, psk []byte) *responderResult {
+func runResponderPSK(conn transport.Conn, psk []byte, suite espSuite, mangle func(*ikemsg.Proposal)) *responderResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	res := &responderResult{}
@@ -553,12 +579,16 @@ func runResponderPSK(conn transport.Conn, psk []byte) *responderResult {
 	var childSPIBuf [4]byte
 	rand.Read(childSPIBuf[:])
 	res.childResponderSPI = binary.BigEndian.Uint32(childSPIBuf[:])
-	res.childKeys = rs.ikeSA.DeriveChildKeys(ni, nr, espEncrKeyLen, espIntegKeyLen)
+	res.childKeys = rs.ikeSA.DeriveChildKeys(ni, nr, suite.encrKeyLen, suite.integKeyLen)
 
+	prop := buildESPProposalForSuite(1, suite, childSPIBuf[:])
+	if mangle != nil {
+		mangle(&prop)
+	}
 	m4 := ikemsg.Payloads{
 		&ikemsg.IDrPayload{IDType: ikemsg.IDType(idr.Type), Data: idr.Data},
 		&ikemsg.AuthPayload{Method: iauth.MethodSharedKeyMIC, Data: respAuth},
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposal(1, childSPIBuf[:])}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{prop}},
 	}
 	appendTrafficSelectors(&m4, false)
 	ip := netip.MustParseAddr("10.10.0.77").As4()
@@ -578,6 +608,121 @@ func runResponderPSK(conn transport.Conn, psk []byte) *responderResult {
 		return fail(err)
 	}
 	return res
+}
+
+// newPSKInitSession builds the standard PSK initiator session over a fresh
+// memory pair, optionally restricting the enabled ESP suites.
+func newPSKInitSession(psk []byte, suites []esp.Suite) (*Session, transport.Conn) {
+	initConn, respConn := transport.MemoryPair()
+	s := New(Config{
+		Server:          "mem:500",
+		LocalID:         WireID{Type: uint8(ikemsg.IDTypeFQDN), Data: []byte("client.test")},
+		RemoteID:        WireID{Type: uint8(ikemsg.IDTypeFQDN), Data: []byte("vpn.test")},
+		PSK:             psk,
+		ESPSuites:       suites,
+		Logger:          slog.New(slog.DiscardHandler),
+		RetransmitBase:  2 * time.Second,
+		RetransmitMax:   4 * time.Second,
+		RetransmitTries: 3,
+	})
+	s.conn = initConn
+	return s, respConn
+}
+
+// TestOfflineHandshakePSKDisabledSuiteRejected pins the enabled-suite gate: the
+// client restricts the offer to CBC via Config.ESPSuites, but the responder
+// answers with a GCM selection. IKE_AUTH must fail — a suite the operator
+// disabled must never be installed, even if the server picked it.
+func TestOfflineHandshakePSKDisabledSuiteRejected(t *testing.T) {
+	psk := []byte("a-strong-preshared-key")
+	initSess, respConn := newPSKInitSession(psk, []esp.Suite{esp.SuiteAESCBC256SHA256})
+
+	gcm := mustSuite(t, esp.SuiteAESGCM256)
+	respDone := make(chan *responderResult, 1)
+	go func() { respDone <- runResponderPSK(respConn, psk, gcm, nil) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := initSess.IKESAInit(ctx); err != nil {
+		t.Fatalf("IKESAInit: %v", err)
+	}
+	err := initSess.IKEAuth(ctx)
+	if err == nil {
+		t.Fatal("IKE_AUTH accepted a suite the config disabled")
+	}
+	if !strings.Contains(err.Error(), "unsupported or ambiguous ESP proposal") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if initSess.Established() {
+		t.Fatal("session must not be established")
+	}
+	<-respDone
+}
+
+// TestOfflineHandshakePSKAmbiguousSelectionRejected: the responder echoes a
+// "selection" that still carries two ENCR alternatives — with several suites
+// offered such a reply leaves the KEYMAT lengths undefined, so IKE_AUTH must
+// reject it instead of guessing.
+func TestOfflineHandshakePSKAmbiguousSelectionRejected(t *testing.T) {
+	psk := []byte("a-strong-preshared-key")
+	initSess, respConn := newPSKInitSession(psk, nil)
+
+	gcm := mustSuite(t, esp.SuiteAESGCM256)
+	ambiguous := func(p *ikemsg.Proposal) {
+		p.Transforms = append(p.Transforms,
+			ikemsg.Transform{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_CHACHA20_POLY1305})
+	}
+	respDone := make(chan *responderResult, 1)
+	go func() { respDone <- runResponderPSK(respConn, psk, gcm, ambiguous) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := initSess.IKESAInit(ctx); err != nil {
+		t.Fatalf("IKESAInit: %v", err)
+	}
+	err := initSess.IKEAuth(ctx)
+	if err == nil {
+		t.Fatal("IKE_AUTH accepted an ambiguous two-ENCR selection")
+	}
+	if !strings.Contains(err.Error(), "unsupported or ambiguous ESP proposal") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if initSess.Established() {
+		t.Fatal("session must not be established")
+	}
+	<-respDone
+}
+
+// TestOfflineHandshakePSKShortResponderSPIRejected pins that the final
+// IKE_AUTH response validates the responder Child-SA SPI length before reading
+// it: a malformed 3-byte SPI must be rejected cleanly, not panic.
+func TestOfflineHandshakePSKShortResponderSPIRejected(t *testing.T) {
+	psk := []byte("a-strong-preshared-key")
+	initSess, respConn := newPSKInitSession(psk, nil)
+
+	respDone := make(chan *responderResult, 1)
+	go func() {
+		respDone <- runResponderPSK(respConn, psk, cbcSuite(), func(p *ikemsg.Proposal) {
+			p.SPI = p.SPI[:3]
+		})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := initSess.IKESAInit(ctx); err != nil {
+		t.Fatalf("IKESAInit: %v", err)
+	}
+	err := initSess.IKEAuth(ctx)
+	if err == nil {
+		t.Fatal("IKE_AUTH accepted a responder ESP proposal with a short SPI")
+	}
+	if !strings.Contains(err.Error(), "invalid SPI length 3") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if initSess.Established() {
+		t.Fatal("session must not be established")
+	}
+	<-respDone
 }
 
 // TestEAPSuccessWithoutMSCHAPVerifyRejected is the session-level finding #12: a
